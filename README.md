@@ -1,39 +1,42 @@
 # macb-xdp
 
-Out-of-tree build of the Cadence MACB/GEM Ethernet driver, used as a baseline
-for adding native XDP support.
+Out-of-tree Cadence MACB/GEM Ethernet driver with native XDP support.
 
-## Source
+## What's changed
 
-The driver source files (`macb_main.c`, `macb.h`, `macb_ptp.c`) are copied
-verbatim from the
-[raspberrypi/linux](https://github.com/raspberrypi/linux) repository,
-branch `rpi-6.18.y` (`drivers/net/ethernet/cadence/`).
+Based on the upstream driver from
+[raspberrypi/linux](https://github.com/raspberrypi/linux) `rpi-6.18.y`
+(`drivers/net/ethernet/cadence/`), with these additions:
 
-This is the unmodified upstream driver and serves as the clean starting point
-for the XDP development work.
+- **Page pool RX** — `gem_rx()`/`gem_rx_refill()` use `page_pool` instead of
+  `netdev_alloc_skb()`, enabling zero-copy XDP buffer management.
+- **XDP core** — `.ndo_bpf` program attach/detach, RX verdict handling
+  (`XDP_PASS`, `XDP_DROP`, `XDP_TX`, `XDP_ABORTED`).
+- **XDP redirect** — `.ndo_xdp_xmit` for `XDP_REDIRECT` from other devices
+  and cross-device forwarding.
 
 ## Build
 
-You need a pre-built kernel source tree that matches the running kernel.
-On Raspberry Pi OS the headers are typically installed under
-`/lib/modules/$(uname -r)/build`.
+Requires kernel headers matching the running kernel.
 
 ```bash
-# Build against the running kernel (default)
 make
-
-# Build against a specific kernel tree
-make KDIR=/path/to/kernel/build
-
-# Clean
-make clean
+sudo insmod macb.ko    # or replace the in-tree module
 ```
 
-The build produces `macb.ko`.
+## Usage
 
-## Goal
+```bash
+# Attach an XDP program
+ip link set dev eth0 xdp obj xdp_pass.o sec xdp
 
-Add native XDP support to the macb/GEM driver so that eBPF programs can run
-directly in the driver's RX hot path (before `sk_buff` allocation), enabling
-high-performance packet processing on Raspberry Pi and similar platforms.
+# Detach
+ip link set dev eth0 xdp off
+```
+
+Works with EtherCAT userspace masters using `xdp-native` transport.
+
+## Tested on
+
+- Raspberry Pi (aarch64), kernel 6.18.35-v8-16k-rt
+- 3 EtherCAT slaves via native XDP transport
