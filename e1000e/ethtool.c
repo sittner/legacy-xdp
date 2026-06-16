@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 1999 - 2018 Intel Corporation. */
 
 /* ethtool support for e1000 */
@@ -25,6 +26,8 @@ struct e1000_stats {
 static const char e1000e_priv_flags_strings[][ETH_GSTRING_LEN] = {
 #define E1000E_PRIV_FLAGS_S0IX_ENABLED	BIT(0)
 	"s0ix-enabled",
+#define E1000E_PRIV_FLAGS_DISABLE_K1	BIT(1)
+	"disable-k1",
 };
 
 #define E1000E_PRIV_FLAGS_STR_LEN ARRAY_SIZE(e1000e_priv_flags_strings)
@@ -549,11 +552,11 @@ static int e1000_set_eeprom(struct net_device *netdev,
 	struct e1000_adapter *adapter = netdev_priv(netdev);
 	struct e1000_hw *hw = &adapter->hw;
 	u16 *eeprom_buff;
-	void *ptr;
-	int max_len;
+	int ret_val = 0;
+	size_t max_len;
 	int first_word;
 	int last_word;
-	int ret_val = 0;
+	void *ptr;
 	u16 i;
 
 	if (eeprom->len == 0)
@@ -958,7 +961,7 @@ static int e1000_eeprom_test(struct e1000_adapter *adapter, u64 *data)
 	}
 
 	/* If Checksum is not Correct return error else test passed */
-	if ((checksum != (u16)NVM_SUM) && !(*data))
+	if (checksum != NVM_SUM && !(*data))
 		*data = 2;
 
 	return *data;
@@ -1170,8 +1173,7 @@ static int e1000_setup_desc_rings(struct e1000_adapter *adapter)
 	if (!tx_ring->count)
 		tx_ring->count = E1000_DEFAULT_TXD;
 
-	tx_ring->buffer_info = kcalloc(tx_ring->count,
-				       sizeof(struct e1000_buffer), GFP_KERNEL);
+	tx_ring->buffer_info = kzalloc_objs(struct e1000_buffer, tx_ring->count);
 	if (!tx_ring->buffer_info) {
 		ret_val = 1;
 		goto err_nomem;
@@ -1231,8 +1233,7 @@ static int e1000_setup_desc_rings(struct e1000_adapter *adapter)
 	if (!rx_ring->count)
 		rx_ring->count = E1000_DEFAULT_RXD;
 
-	rx_ring->buffer_info = kcalloc(rx_ring->count,
-				       sizeof(struct e1000_buffer), GFP_KERNEL);
+	rx_ring->buffer_info = kzalloc_objs(struct e1000_buffer, rx_ring->count);
 	if (!rx_ring->buffer_info) {
 		ret_val = 5;
 		goto err_nomem;
@@ -2095,56 +2096,55 @@ static void e1000_get_strings(struct net_device __always_unused *netdev,
 	}
 }
 
-static int e1000_get_rxnfc(struct net_device *netdev,
-			   struct ethtool_rxnfc *info,
-			   u32 __always_unused *rule_locs)
+static int e1000_get_rxfh_fields(struct net_device *netdev,
+				 struct ethtool_rxfh_fields *info)
 {
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+	struct e1000_hw *hw = &adapter->hw;
+	u32 mrqc;
+
 	info->data = 0;
 
-	switch (info->cmd) {
-	case ETHTOOL_GRXFH: {
-		struct e1000_adapter *adapter = netdev_priv(netdev);
-		struct e1000_hw *hw = &adapter->hw;
-		u32 mrqc;
+	mrqc = er32(MRQC);
 
-		mrqc = er32(MRQC);
-
-		if (!(mrqc & E1000_MRQC_RSS_FIELD_MASK))
-			return 0;
-
-		switch (info->flow_type) {
-		case TCP_V4_FLOW:
-			if (mrqc & E1000_MRQC_RSS_FIELD_IPV4_TCP)
-				info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
-			fallthrough;
-		case UDP_V4_FLOW:
-		case SCTP_V4_FLOW:
-		case AH_ESP_V4_FLOW:
-		case IPV4_FLOW:
-			if (mrqc & E1000_MRQC_RSS_FIELD_IPV4)
-				info->data |= RXH_IP_SRC | RXH_IP_DST;
-			break;
-		case TCP_V6_FLOW:
-			if (mrqc & E1000_MRQC_RSS_FIELD_IPV6_TCP)
-				info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
-			fallthrough;
-		case UDP_V6_FLOW:
-		case SCTP_V6_FLOW:
-		case AH_ESP_V6_FLOW:
-		case IPV6_FLOW:
-			if (mrqc & E1000_MRQC_RSS_FIELD_IPV6)
-				info->data |= RXH_IP_SRC | RXH_IP_DST;
-			break;
-		default:
-			break;
-		}
+	if (!(mrqc & E1000_MRQC_RSS_FIELD_MASK))
 		return 0;
-	}
+
+	switch (info->flow_type) {
+	case TCP_V4_FLOW:
+		if (mrqc & E1000_MRQC_RSS_FIELD_IPV4_TCP)
+			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+		fallthrough;
+	case UDP_V4_FLOW:
+	case SCTP_V4_FLOW:
+	case AH_ESP_V4_FLOW:
+	case IPV4_FLOW:
+		if (mrqc & E1000_MRQC_RSS_FIELD_IPV4)
+			info->data |= RXH_IP_SRC | RXH_IP_DST;
+		break;
+	case TCP_V6_FLOW:
+		if (mrqc & E1000_MRQC_RSS_FIELD_IPV6_TCP)
+			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
+		fallthrough;
+	case UDP_V6_FLOW:
+	case SCTP_V6_FLOW:
+	case AH_ESP_V6_FLOW:
+	case IPV6_FLOW:
+		if (mrqc & E1000_MRQC_RSS_FIELD_IPV6)
+			info->data |= RXH_IP_SRC | RXH_IP_DST;
+		break;
 	default:
-		return -EOPNOTSUPP;
+		break;
 	}
+	return 0;
 }
 
+
+/* struct ethtool_keee (with linkmode bitmask fields) was introduced in 6.5.
+ * On older kernels the ethtool_ops callbacks use struct ethtool_eee with
+ * u32 advertised/supported/lp_advertised fields.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0)
 static int e1000e_get_eee(struct net_device *netdev, struct ethtool_keee *edata)
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
@@ -2260,6 +2260,122 @@ static int e1000e_set_eee(struct net_device *netdev, struct ethtool_keee *edata)
 
 	return 0;
 }
+#else /* LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0) */
+
+/* Legacy EEE callbacks for kernels 6.1-6.4 that use struct ethtool_eee
+ * with u32 advertised bitmask fields.
+ */
+static int e1000e_get_eee(struct net_device *netdev, struct ethtool_eee *edata)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+	struct e1000_hw *hw = &adapter->hw;
+	u16 cap_addr, lpa_addr, pcs_stat_addr, phy_data;
+	u32 ret_val;
+
+	if (!(adapter->flags2 & FLAG2_HAS_EEE))
+		return -EOPNOTSUPP;
+
+	switch (hw->phy.type) {
+	case e1000_phy_82579:
+		cap_addr = I82579_EEE_CAPABILITY;
+		lpa_addr = I82579_EEE_LP_ABILITY;
+		pcs_stat_addr = I82579_EEE_PCS_STATUS;
+		break;
+	case e1000_phy_i217:
+		cap_addr = I217_EEE_CAPABILITY;
+		lpa_addr = I217_EEE_LP_ABILITY;
+		pcs_stat_addr = I217_EEE_PCS_STATUS;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	ret_val = hw->phy.ops.acquire(hw);
+	if (ret_val)
+		return -EBUSY;
+
+	/* EEE Capability */
+	ret_val = e1000_read_emi_reg_locked(hw, cap_addr, &phy_data);
+	if (ret_val)
+		goto release;
+	edata->supported = (phy_data & MDIO_EEE_100TX ? ADVERTISED_100baseT_Full : 0) |
+			   (phy_data & MDIO_EEE_1000T ? ADVERTISED_1000baseT_Full : 0);
+
+	/* EEE Advertised */
+	edata->advertised = (adapter->eee_advert & MDIO_EEE_100TX ? ADVERTISED_100baseT_Full : 0) |
+			    (adapter->eee_advert & MDIO_EEE_1000T ? ADVERTISED_1000baseT_Full : 0);
+
+	/* EEE Link Partner Advertised */
+	ret_val = e1000_read_emi_reg_locked(hw, lpa_addr, &phy_data);
+	if (ret_val)
+		goto release;
+	edata->lp_advertised = (phy_data & MDIO_EEE_100TX ? ADVERTISED_100baseT_Full : 0) |
+				(phy_data & MDIO_EEE_1000T ? ADVERTISED_1000baseT_Full : 0);
+
+	/* EEE PCS Status */
+	ret_val = e1000_read_emi_reg_locked(hw, pcs_stat_addr, &phy_data);
+	if (ret_val)
+		goto release;
+	if (hw->phy.type == e1000_phy_82579)
+		phy_data <<= 8;
+
+	if (phy_data & (E1000_EEE_TX_LPI_RCVD | E1000_EEE_RX_LPI_RCVD))
+		edata->eee_active = 1;
+
+	edata->eee_enabled = !hw->dev_spec.ich8lan.eee_disable;
+	edata->tx_lpi_enabled = 1;
+	edata->tx_lpi_timer = er32(LPIC) >> E1000_LPIC_LPIET_SHIFT;
+
+release:
+	hw->phy.ops.release(hw);
+	if (ret_val)
+		ret_val = -ENODATA;
+
+	return ret_val;
+}
+
+static int e1000e_set_eee(struct net_device *netdev, struct ethtool_eee *edata)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+	struct ethtool_eee eee_curr;
+	struct e1000_hw *hw = &adapter->hw;
+	s32 ret_val;
+
+	ret_val = e1000e_get_eee(netdev, &eee_curr);
+	if (ret_val)
+		return ret_val;
+
+	if (eee_curr.tx_lpi_enabled != edata->tx_lpi_enabled) {
+		e_err("Setting EEE tx-lpi is not supported\n");
+		return -EINVAL;
+	}
+
+	if (eee_curr.tx_lpi_timer != edata->tx_lpi_timer) {
+		e_err("Setting EEE Tx LPI timer is not supported\n");
+		return -EINVAL;
+	}
+
+	if (edata->advertised & ~(ADVERTISED_100baseT_Full | ADVERTISED_1000baseT_Full)) {
+		e_err("EEE advertisement supports only 100TX and/or 1000T full-duplex\n");
+		return -EINVAL;
+	}
+
+	adapter->eee_advert =
+		((edata->advertised & ADVERTISED_100baseT_Full) ? MDIO_EEE_100TX : 0) |
+		((edata->advertised & ADVERTISED_1000baseT_Full) ? MDIO_EEE_1000T : 0);
+
+	hw->dev_spec.ich8lan.eee_disable = !edata->eee_enabled;
+
+	/* reset the link */
+	if (netif_running(netdev))
+		e1000e_reinit_locked(adapter);
+	else
+		e1000e_reset(adapter);
+
+	return 0;
+}
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,5,0) */
+
 
 static int e1000e_get_ts_info(struct net_device *netdev,
 			      struct kernel_ethtool_ts_info *info)
@@ -2303,25 +2419,58 @@ static u32 e1000e_get_priv_flags(struct net_device *netdev)
 	if (adapter->flags2 & FLAG2_ENABLE_S0IX_FLOWS)
 		priv_flags |= E1000E_PRIV_FLAGS_S0IX_ENABLED;
 
+	if (adapter->flags2 & FLAG2_DISABLE_K1)
+		priv_flags |= E1000E_PRIV_FLAGS_DISABLE_K1;
+
 	return priv_flags;
 }
 
 static int e1000e_set_priv_flags(struct net_device *netdev, u32 priv_flags)
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
+	struct e1000_hw *hw = &adapter->hw;
 	unsigned int flags2 = adapter->flags2;
+	unsigned int changed;
 
-	flags2 &= ~FLAG2_ENABLE_S0IX_FLOWS;
+	flags2 &= ~(FLAG2_ENABLE_S0IX_FLOWS | FLAG2_DISABLE_K1);
+
 	if (priv_flags & E1000E_PRIV_FLAGS_S0IX_ENABLED) {
-		struct e1000_hw *hw = &adapter->hw;
-
-		if (hw->mac.type < e1000_pch_cnp)
+		if (hw->mac.type < e1000_pch_cnp) {
+			e_err("S0ix is not supported on this device\n");
 			return -EINVAL;
+		}
+
 		flags2 |= FLAG2_ENABLE_S0IX_FLOWS;
 	}
 
-	if (flags2 != adapter->flags2)
+	if (priv_flags & E1000E_PRIV_FLAGS_DISABLE_K1) {
+		if (hw->mac.type < e1000_ich8lan) {
+			e_err("Disabling K1 is not supported on this device\n");
+			return -EINVAL;
+		}
+
+		flags2 |= FLAG2_DISABLE_K1;
+	}
+
+	changed = adapter->flags2 ^ flags2;
+	if (changed)
 		adapter->flags2 = flags2;
+
+	if (changed & FLAG2_DISABLE_K1) {
+		/* reset the hardware to apply the changes */
+		while (test_and_set_bit(__E1000_RESETTING,
+					&adapter->state))
+			usleep_range(1000, 2000);
+
+		if (netif_running(adapter->netdev)) {
+			e1000e_down(adapter, true);
+			e1000e_up(adapter);
+		} else {
+			e1000e_reset(adapter);
+		}
+
+		clear_bit(__E1000_RESETTING, &adapter->state);
+	}
 
 	return 0;
 }
@@ -2351,7 +2500,7 @@ static const struct ethtool_ops e1000_ethtool_ops = {
 	.get_sset_count		= e1000e_get_sset_count,
 	.get_coalesce		= e1000_get_coalesce,
 	.set_coalesce		= e1000_set_coalesce,
-	.get_rxnfc		= e1000_get_rxnfc,
+	.get_rxfh_fields	= e1000_get_rxfh_fields,
 	.get_ts_info		= e1000e_get_ts_info,
 	.get_eee		= e1000e_get_eee,
 	.set_eee		= e1000e_set_eee,

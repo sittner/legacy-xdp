@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /* Copyright(c) 1999 - 2018 Intel Corporation. */
 
 /* 80003ES2LAN Gigabit Ethernet Controller (Copper)
