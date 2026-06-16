@@ -3580,7 +3580,6 @@ static int macb_xdp(struct net_device *dev, struct netdev_bpf *bpf)
 
 		old_prog = rtnl_dereference(bp->xdp_prog);
 		rcu_assign_pointer(bp->xdp_prog, bpf->prog);
-		bpf_prog_change_xdp(old_prog, bpf->prog);
 		if (old_prog)
 			bpf_prog_put(old_prog);
 		return 0;
