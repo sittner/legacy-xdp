@@ -6099,6 +6099,90 @@ static int e1000_change_mtu(struct net_device *netdev, int new_mtu)
 	return 0;
 }
 
+/**
+ * e1000e_hwtstamp_set - control hardware time stamping
+ * @netdev: network interface device structure
+ * @config: timestamp configuration
+ * @extack: netlink extended ACK report
+ *
+ * Outgoing time stamping can be enabled and disabled. Play nice and
+ * disable it when requested, although it shouldn't cause any overhead
+ * when no packet needs it. At most one packet in the queue may be
+ * marked for time stamping, otherwise it would be impossible to tell
+ * for sure to which packet the hardware time stamp belongs.
+ *
+ * Incoming time stamping has to be configured via the hardware filters.
+ * Not all combinations are supported, in particular event type has to be
+ * specified. Matching the kind of event packet is not supported, with the
+ * exception of "all V2 events regardless of level 2 or 4".
+ **/
+static int e1000e_hwtstamp_set(struct net_device *netdev,
+			       struct kernel_hwtstamp_config *config,
+			       struct netlink_ext_ack *extack)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+	int ret_val;
+
+	ret_val = e1000e_config_hwtstamp(adapter, config, extack);
+	if (ret_val)
+		return ret_val;
+
+	switch (config->rx_filter) {
+	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_SYNC:
+	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
+	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
+	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
+		/* With V2 type filters which specify a Sync or Delay Request,
+		 * Path Delay Request/Response messages are also time stamped
+		 * by hardware so notify the caller the requested packets plus
+		 * some others are time stamped.
+		 */
+		config->rx_filter = HWTSTAMP_FILTER_SOME;
+		break;
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static int e1000e_hwtstamp_get(struct net_device *netdev,
+			       struct kernel_hwtstamp_config *kernel_config)
+{
+	struct e1000_adapter *adapter = netdev_priv(netdev);
+
+	*kernel_config = adapter->hwtstamp_config;
+
+	return 0;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,8,0)
+/* On kernels older than 6.8 there are no ndo_hwtstamp_get/set ops;
+ * hardware timestamping is configured through ndo_eth_ioctl instead.
+ * e1000e_hwtstamp_{get,set} still work because kernel_hwtstamp_config
+ * is aliased to hwtstamp_config in compat.h.
+ */
+static int e1000e_hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr,
+				 int cmd)
+{
+	struct hwtstamp_config cfg;
+
+	if (cmd == SIOCSHWTSTAMP) {
+		if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+			return -EFAULT;
+		return e1000e_hwtstamp_set(netdev, &cfg, NULL);
+	}
+	/* SIOCGHWTSTAMP */
+	if (e1000e_hwtstamp_get(netdev, &cfg))
+		return -EINVAL;
+	if (copy_to_user(ifr->ifr_data, &cfg, sizeof(cfg)))
+		return -EFAULT;
+	return 0;
+}
+#endif
+
 static int e1000_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 {
 	struct e1000_adapter *adapter = netdev_priv(netdev);
@@ -6158,90 +6242,6 @@ static int e1000_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
 	default:
 		return -EOPNOTSUPP;
 	}
-	return 0;
-}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,8,0)
-/* On kernels older than 6.8 there are no ndo_hwtstamp_get/set ops;
- * hardware timestamping is configured through ndo_eth_ioctl instead.
- * e1000e_hwtstamp_{get,set} still work because kernel_hwtstamp_config
- * is aliased to hwtstamp_config in compat.h.
- */
-static int e1000e_hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr,
-				 int cmd)
-{
-	struct hwtstamp_config cfg;
-
-	if (cmd == SIOCSHWTSTAMP) {
-		if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
-			return -EFAULT;
-		return e1000e_hwtstamp_set(netdev, &cfg, NULL);
-	}
-	/* SIOCGHWTSTAMP */
-	if (e1000e_hwtstamp_get(netdev, &cfg))
-		return -EINVAL;
-	if (copy_to_user(ifr->ifr_data, &cfg, sizeof(cfg)))
-		return -EFAULT;
-	return 0;
-}
-#endif
-
-/**
- * e1000e_hwtstamp_set - control hardware time stamping
- * @netdev: network interface device structure
- * @config: timestamp configuration
- * @extack: netlink extended ACK report
- *
- * Outgoing time stamping can be enabled and disabled. Play nice and
- * disable it when requested, although it shouldn't cause any overhead
- * when no packet needs it. At most one packet in the queue may be
- * marked for time stamping, otherwise it would be impossible to tell
- * for sure to which packet the hardware time stamp belongs.
- *
- * Incoming time stamping has to be configured via the hardware filters.
- * Not all combinations are supported, in particular event type has to be
- * specified. Matching the kind of event packet is not supported, with the
- * exception of "all V2 events regardless of level 2 or 4".
- **/
-static int e1000e_hwtstamp_set(struct net_device *netdev,
-			       struct kernel_hwtstamp_config *config,
-			       struct netlink_ext_ack *extack)
-{
-	struct e1000_adapter *adapter = netdev_priv(netdev);
-	int ret_val;
-
-	ret_val = e1000e_config_hwtstamp(adapter, config, extack);
-	if (ret_val)
-		return ret_val;
-
-	switch (config->rx_filter) {
-	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_SYNC:
-	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
-	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
-	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
-		/* With V2 type filters which specify a Sync or Delay Request,
-		 * Path Delay Request/Response messages are also time stamped
-		 * by hardware so notify the caller the requested packets plus
-		 * some others are time stamped.
-		 */
-		config->rx_filter = HWTSTAMP_FILTER_SOME;
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-static int e1000e_hwtstamp_get(struct net_device *netdev,
-			       struct kernel_hwtstamp_config *kernel_config)
-{
-	struct e1000_adapter *adapter = netdev_priv(netdev);
-
-	*kernel_config = adapter->hwtstamp_config;
-
 	return 0;
 }
 
