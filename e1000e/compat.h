@@ -12,8 +12,10 @@
 /* RUNTIME_PM_OPS() was introduced in 6.3.  On 6.1/6.2 only
  * SET_RUNTIME_PM_OPS() is available; define the new macro as a thin
  * wrapper so the rest of the code can use the 6.3+ spelling unchanged.
+ * Some vendor kernels (e.g. Debian 6.1.0-49) backport the macro, so
+ * guard with #ifndef rather than a version check.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,3,0)
+#ifndef RUNTIME_PM_OPS
 #define RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn) \
 	SET_RUNTIME_PM_OPS(suspend_fn, resume_fn, idle_fn)
 #endif

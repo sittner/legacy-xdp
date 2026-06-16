@@ -2096,6 +2096,7 @@ static void e1000_get_strings(struct net_device __always_unused *netdev,
 	}
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0)
 static int e1000_get_rxfh_fields(struct net_device *netdev,
 				 struct ethtool_rxfh_fields *info)
 {
@@ -2138,7 +2139,7 @@ static int e1000_get_rxfh_fields(struct net_device *netdev,
 	}
 	return 0;
 }
-
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0) */
 
 /* struct ethtool_keee (with linkmode bitmask fields) was introduced in 6.5.
  * On older kernels the ethtool_ops callbacks use struct ethtool_eee with
@@ -2500,7 +2501,9 @@ static const struct ethtool_ops e1000_ethtool_ops = {
 	.get_sset_count		= e1000e_get_sset_count,
 	.get_coalesce		= e1000_get_coalesce,
 	.set_coalesce		= e1000_set_coalesce,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0)
 	.get_rxfh_fields	= e1000_get_rxfh_fields,
+#endif
 	.get_ts_info		= e1000e_get_ts_info,
 	.get_eee		= e1000e_get_eee,
 	.set_eee		= e1000e_set_eee,
