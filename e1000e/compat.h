@@ -145,8 +145,11 @@ static inline void page_pool_dma_sync_for_cpu(const struct page_pool *pool,
 					      const struct page *page,
 					      u32 offset, u32 dma_sync_size)
 {
+	/* Cast away const: the 6.1 page_pool_get_dma_addr() lacks the const
+	 * qualifier on its argument even though it only reads from the page.
+	 */
 	dma_sync_single_range_for_cpu(pool->p.dev,
-				      page_pool_get_dma_addr(page),
+				      page_pool_get_dma_addr((struct page *)page),
 				      offset, dma_sync_size,
 				      pool->p.dma_dir);
 }
