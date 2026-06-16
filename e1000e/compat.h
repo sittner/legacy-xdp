@@ -43,4 +43,33 @@
 	((typeof(TYPE_OR_VAR) *)kcalloc((COUNT), sizeof(typeof(TYPE_OR_VAR)), GFP_KERNEL))
 #endif
 
+/* timer_container_of() was introduced in 6.12 as a replacement for
+ * from_timer().  It is a macro so #ifndef is safe.
+ */
+#ifndef timer_container_of
+#define timer_container_of(var, callback_timer, timer_fieldname) \
+	from_timer(var, callback_timer, timer_fieldname)
+#endif
+
+/* netif_napi_set_irq() was introduced in 6.5 to associate a NAPI instance
+ * with a specific IRQ for affinity hinting.  It is a no-op on older kernels.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0)
+static inline void netif_napi_set_irq(struct napi_struct *napi, int irq) {}
+#endif
+
+/* netif_queue_set_napi() and the netdev_queue_type enum were introduced in
+ * 6.6.  Provide empty stubs on older kernels.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,6,0)
+enum netdev_queue_type {
+	NETDEV_QUEUE_TYPE_RX,
+	NETDEV_QUEUE_TYPE_TX,
+};
+static inline void netif_queue_set_napi(struct net_device *dev,
+					unsigned int queue_index,
+					enum netdev_queue_type type,
+					struct napi_struct *napi) {}
+#endif
+
 #endif /* _E1000E_COMPAT_H_ */
