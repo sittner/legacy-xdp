@@ -2380,7 +2380,7 @@ int e1000e_setup_rx_resources(struct e1000_ring *rx_ring)
 		.pool_size = rx_ring->count,
 		.nid      = NUMA_NO_NODE,
 		.dev      = &adapter->pdev->dev,
-		.napi     = &adapter->napi,
+		E1000E_PAGE_POOL_NAPI_INIT(&adapter->napi)
 		.dma_dir  = DMA_FROM_DEVICE,
 		.max_len  = PAGE_SIZE,
 		.offset   = E1000_RX_PAGE_OFFSET,
