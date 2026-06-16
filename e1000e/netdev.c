@@ -706,6 +706,10 @@ write_desc:
 static void e1000_alloc_rx_buffers_ps(struct e1000_ring *rx_ring,
 				      int cleaned_count, gfp_t gfp)
 {
+	/* NOTE: The packet-split (PS) RX path is not supported for XDP and uses
+	 * legacy DMA buffer allocation.  XDP requires the normal or jumbo RX
+	 * path which use page_pool.
+	 */
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
 	struct pci_dev *pdev = adapter->pdev;
@@ -813,9 +817,9 @@ static void e1000_alloc_jumbo_rx_buffers(struct e1000_ring *rx_ring,
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
-	struct pci_dev *pdev = adapter->pdev;
 	union e1000_rx_desc_extended *rx_desc;
 	struct e1000_buffer *buffer_info;
+	dma_addr_t dma;
 	struct sk_buff *skb;
 	unsigned int i;
 	unsigned int bufsz = 256 - 16;	/* for skb_reserve */
@@ -841,26 +845,18 @@ static void e1000_alloc_jumbo_rx_buffers(struct e1000_ring *rx_ring,
 check_page:
 		/* allocate a new page if necessary */
 		if (!buffer_info->page) {
-			buffer_info->page = alloc_page(gfp);
+			buffer_info->page =
+				page_pool_dev_alloc_pages(rx_ring->page_pool);
 			if (unlikely(!buffer_info->page)) {
 				adapter->alloc_rx_buff_failed++;
 				break;
 			}
 		}
 
-		if (!buffer_info->dma) {
-			buffer_info->dma = dma_map_page(&pdev->dev,
-							buffer_info->page, 0,
-							PAGE_SIZE,
-							DMA_FROM_DEVICE);
-			if (dma_mapping_error(&pdev->dev, buffer_info->dma)) {
-				adapter->alloc_rx_buff_failed++;
-				break;
-			}
-		}
-
+		dma = page_pool_get_dma_addr(buffer_info->page) +
+		      E1000_RX_PAGE_OFFSET;
 		rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
-		rx_desc->read.buffer_addr = cpu_to_le64(buffer_info->dma);
+		rx_desc->read.buffer_addr = cpu_to_le64(dma);
 
 		if (unlikely(++i == rx_ring->count))
 			i = 0;
@@ -1315,6 +1311,10 @@ static bool e1000_clean_tx_irq(struct e1000_ring *tx_ring)
 static bool e1000_clean_rx_irq_ps(struct e1000_ring *rx_ring, int *work_done,
 				  int work_to_do)
 {
+	/* NOTE: The packet-split (PS) RX path is not supported for XDP and uses
+	 * legacy DMA buffer allocation.  XDP requires the normal or jumbo RX
+	 * path which use page_pool.
+	 */
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct e1000_hw *hw = &adapter->hw;
 	union e1000_rx_desc_packet_split *rx_desc, *next_rxd;
@@ -1500,7 +1500,7 @@ static void e1000_consume_page(struct e1000_buffer *bi, struct sk_buff *skb,
 }
 
 /**
- * e1000_clean_jumbo_rx_irq - Send received data up the network stack; legacy
+ * e1000_clean_jumbo_rx_irq - Send received data up the network stack
  * @rx_ring: Rx descriptor ring
  * @work_done: output parameter for indicating completed work
  * @work_to_do: how many packets we can clean
@@ -1513,7 +1513,6 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
-	struct pci_dev *pdev = adapter->pdev;
 	union e1000_rx_desc_extended *rx_desc, *next_rxd;
 	struct e1000_buffer *buffer_info, *next_buffer;
 	u32 length, staterr;
@@ -1549,9 +1548,10 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 
 		cleaned = true;
 		cleaned_count++;
-		dma_unmap_page(&pdev->dev, buffer_info->dma, PAGE_SIZE,
-			       DMA_FROM_DEVICE);
-		buffer_info->dma = 0;
+		page_pool_dma_sync_for_cpu(rx_ring->page_pool,
+					   buffer_info->page,
+					   E1000_RX_PAGE_OFFSET,
+					   PAGE_SIZE - E1000_RX_PAGE_OFFSET);
 
 		length = le16_to_cpu(rx_desc->wb.upper.length);
 
@@ -1575,6 +1575,7 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 				rxtop = skb;
 				skb_fill_page_desc(rxtop, 0, buffer_info->page,
 						   0, length);
+				skb_mark_for_recycle(rxtop);
 			} else {
 				/* this is the middle of a chain */
 				shinfo = skb_shinfo(rxtop);
@@ -1619,6 +1620,7 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 							   length);
 					e1000_consume_page(buffer_info, skb,
 							   length);
+					skb_mark_for_recycle(skb);
 				}
 			}
 		}
@@ -1685,8 +1687,9 @@ static void e1000_clean_rx_ring(struct e1000_ring *rx_ring)
 	for (i = 0; i < rx_ring->count; i++) {
 		buffer_info = &rx_ring->buffer_info[i];
 
-		if (adapter->clean_rx == e1000_clean_rx_irq) {
-			/* page_pool path: return page to the pool */
+		if (adapter->clean_rx == e1000_clean_rx_irq ||
+		    adapter->clean_rx == e1000_clean_jumbo_rx_irq) {
+			/* page_pool path (normal and jumbo): return page */
 			if (buffer_info->page) {
 				page_pool_put_full_page(rx_ring->page_pool,
 							buffer_info->page,
@@ -1694,14 +1697,9 @@ static void e1000_clean_rx_ring(struct e1000_ring *rx_ring)
 				buffer_info->page = NULL;
 			}
 		} else {
-			/* jumbo and PS paths: use the old DMA/page cleanup */
+			/* PS path: use the old DMA/page cleanup */
 			if (buffer_info->dma) {
-				if (adapter->clean_rx == e1000_clean_jumbo_rx_irq)
-					dma_unmap_page(&pdev->dev,
-						       buffer_info->dma,
-						       PAGE_SIZE,
-						       DMA_FROM_DEVICE);
-				else if (adapter->clean_rx == e1000_clean_rx_irq_ps)
+				if (adapter->clean_rx == e1000_clean_rx_irq_ps)
 					dma_unmap_single(&pdev->dev,
 							 buffer_info->dma,
 							 adapter->rx_ps_bsize0,
