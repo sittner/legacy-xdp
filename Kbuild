@@ -1,0 +1,2 @@
+obj-m := macb.o
+macb-y := macb_main.o macb_ptp.o
