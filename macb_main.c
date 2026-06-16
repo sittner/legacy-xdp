@@ -1274,25 +1274,6 @@ static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_
 	desc->addr = lower_32_bits(addr);
 }
 
-static dma_addr_t macb_get_addr(struct macb *bp, struct macb_dma_desc *desc)
-{
-	dma_addr_t addr = 0;
-#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
-	struct macb_dma_desc_64 *desc_64;
-
-	if (bp->hw_dma_cap & HW_DMA_CAP_64B) {
-		desc_64 = macb_64b_desc(bp, desc);
-		addr = ((u64)(desc_64->addrh) << 32);
-	}
-#endif
-	addr |= MACB_BF(RX_WADDR, MACB_BFEXT(RX_WADDR, desc->addr));
-#ifdef CONFIG_MACB_USE_HWSTAMP
-	if (bp->hw_dma_cap & HW_DMA_CAP_PTP)
-		addr &= ~GEM_BIT(DMA_RXVALID);
-#endif
-	return addr;
-}
-
 static void macb_tx_error_task(struct work_struct *work)
 {
 	struct macb_queue	*queue = container_of(work, struct macb_queue,
