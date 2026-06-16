@@ -72,4 +72,40 @@ static inline void netif_queue_set_napi(struct net_device *dev,
 					struct napi_struct *napi) {}
 #endif
 
+/* diff_by_scaled_ppm() and adjust_by_scaled_ppm() were introduced in 6.2.
+ * Provide equivalent implementations using mul_u64_u64_div_u64, which has
+ * been available since before 6.1.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+#include <linux/math64.h>
+static inline bool diff_by_scaled_ppm(u64 base, long scaled_ppm, u64 *diff)
+{
+	bool negative = false;
+
+	if (scaled_ppm < 0) {
+		negative = true;
+		scaled_ppm = -scaled_ppm;
+	}
+	*diff = mul_u64_u64_div_u64(base, (u64)scaled_ppm, 1000000ULL << 16);
+	return negative;
+}
+
+static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
+{
+	u64 diff;
+
+	if (diff_by_scaled_ppm(base, scaled_ppm, &diff))
+		return base - diff;
+	return base + diff;
+}
+#endif
+
+/* struct system_counterval_t switched from 'struct clocksource *cs' to
+ * 'enum clocksource_ids cs_id' in Linux 6.9.  On older kernels the caller
+ * must use convert_art_to_tsc() to obtain a correctly filled structure.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+#define E1000E_SYSVAL_USES_CS_PTR 1
+#endif
+
 #endif /* _E1000E_COMPAT_H_ */
