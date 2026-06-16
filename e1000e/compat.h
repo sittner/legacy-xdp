@@ -118,6 +118,16 @@ static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
 #define E1000E_CC_READ_CONST
 #endif
 
+/* page_pool headers were reorganised in Linux 6.6: the monolithic
+ * net/page_pool.h was split into net/page_pool/types.h, core.h and helpers.h.
+ * On older kernels include the original combined header.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+#include <net/page_pool/helpers.h>
+#else
+#include <net/page_pool.h>
+#endif
+
 /* struct page_pool_params gained 'netdev' and 'queue_idx' members in Linux
  * 6.6 (inside a struct_group_tagged 'slow' section used for pool statistics).
  * Guard these initializers on older kernels where the fields do not exist.

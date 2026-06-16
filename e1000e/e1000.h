@@ -23,7 +23,6 @@
 #include <linux/mdio.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
-#include <net/page_pool/helpers.h>
 #include "hw.h"
 #include "compat.h"
 
