@@ -40,6 +40,7 @@
 #include <linux/types.h>
 #include <linux/udp.h>
 #include <linux/gcd.h>
+#include <net/page_pool/helpers.h>
 #include <net/pkt_sched.h>
 #include "macb.h"
 
@@ -1519,10 +1520,20 @@ static int macb_tx_complete(struct macb_queue *queue, int budget)
 	return packets;
 }
 
+static unsigned int gem_rx_page_offset(void)
+{
+	return XDP_PACKET_HEADROOM + NET_IP_ALIGN;
+}
+
+static unsigned int gem_rx_page_alloc_size(struct macb *bp)
+{
+	return SKB_HEAD_ALIGN(gem_rx_page_offset() + bp->rx_buffer_size);
+}
+
 static void gem_rx_refill(struct macb_queue *queue)
 {
 	unsigned int		entry;
-	struct sk_buff		*skb;
+	struct page		*page;
 	dma_addr_t		paddr;
 	struct macb *bp = queue->bp;
 	struct macb_dma_desc *desc;
@@ -1536,25 +1547,17 @@ static void gem_rx_refill(struct macb_queue *queue)
 
 		desc = macb_rx_desc(queue, entry);
 
-		if (!queue->rx_skbuff[entry]) {
-			/* allocate sk_buff for this free entry in ring */
-			skb = netdev_alloc_skb(bp->dev, bp->rx_buffer_size);
-			if (unlikely(!skb)) {
-				netdev_err(bp->dev,
-					   "Unable to allocate sk_buff\n");
+		page = queue->rx_buffers_page[entry];
+		if (!page) {
+			page = page_pool_dev_alloc_pages(queue->page_pool);
+			if (unlikely(!page)) {
+				netdev_err(bp->dev, "Unable to allocate RX page\n");
 				break;
 			}
 
-			/* now fill corresponding descriptor entry */
-			paddr = dma_map_single(&bp->pdev->dev, skb->data,
-					       bp->rx_buffer_size,
-					       DMA_FROM_DEVICE);
-			if (dma_mapping_error(&bp->pdev->dev, paddr)) {
-				dev_kfree_skb(skb);
-				break;
-			}
-
-			queue->rx_skbuff[entry] = skb;
+			queue->rx_buffers_page[entry] = page;
+			paddr = page_pool_get_dma_addr(page) +
+				gem_rx_page_offset();
 
 			if (entry == bp->rx_ring_size - 1)
 				paddr |= MACB_BIT(RX_WRAP);
@@ -1564,9 +1567,6 @@ static void gem_rx_refill(struct macb_queue *queue)
 			 */
 			dma_wmb();
 			macb_set_addr(bp, desc, paddr);
-
-			/* properly align Ethernet header */
-			skb_reserve(skb, NET_IP_ALIGN);
 		} else {
 			desc->ctrl = 0;
 			dma_wmb();
@@ -1609,13 +1609,13 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 	struct macb *bp = queue->bp;
 	unsigned int		len;
 	unsigned int		entry;
+	struct page		*page;
 	struct sk_buff		*skb;
 	struct macb_dma_desc	*desc;
 	int			count = 0;
 
 	while (count < budget) {
 		u32 ctrl;
-		dma_addr_t addr;
 		bool rxused;
 
 		entry = macb_rx_ring_wrap(bp, queue->rx_tail);
@@ -1625,7 +1625,6 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 		rmb();
 
 		rxused = (desc->addr & MACB_BIT(RX_USED)) ? true : false;
-		addr = macb_get_addr(bp, desc);
 
 		if (!rxused)
 			break;
@@ -1645,8 +1644,8 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 			queue->stats.rx_dropped++;
 			break;
 		}
-		skb = queue->rx_skbuff[entry];
-		if (unlikely(!skb)) {
+		page = queue->rx_buffers_page[entry];
+		if (unlikely(!page)) {
 			netdev_err(bp->dev,
 				   "inconsistent Rx descriptor chain\n");
 			bp->dev->stats.rx_dropped++;
@@ -1654,14 +1653,23 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 			break;
 		}
 		/* now everything is ready for receiving packet */
-		queue->rx_skbuff[entry] = NULL;
+		queue->rx_buffers_page[entry] = NULL;
 		len = ctrl & bp->rx_frm_len_mask;
 
 		netdev_vdbg(bp->dev, "gem_rx %u (len %u)\n", entry, len);
 
+		page_pool_dma_sync_for_cpu(queue->page_pool, page, 0, len);
+		skb = napi_build_skb(page_address(page), page_size(page));
+		if (unlikely(!skb)) {
+			page_pool_put_full_page(queue->page_pool, page, false);
+			bp->dev->stats.rx_dropped++;
+			queue->stats.rx_dropped++;
+			continue;
+		}
+
+		skb_reserve(skb, gem_rx_page_offset());
 		skb_put(skb, len);
-		dma_unmap_single(&bp->pdev->dev, addr,
-				 bp->rx_buffer_size, DMA_FROM_DEVICE);
+		skb_mark_for_recycle(skb);
 
 		skb->protocol = eth_type_trans(skb, bp->dev);
 		skb_checksum_none_assert(skb);
@@ -2739,34 +2747,30 @@ static void macb_init_rx_buffer_size(struct macb *bp, size_t size)
 
 static void gem_free_rx_buffers(struct macb *bp)
 {
-	struct sk_buff		*skb;
-	struct macb_dma_desc	*desc;
+	struct page		*page;
 	struct macb_queue *queue;
-	dma_addr_t		addr;
 	unsigned int q;
 	int i;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		if (!queue->rx_skbuff)
-			continue;
+		if (queue->rx_buffers_page) {
+			for (i = 0; i < bp->rx_ring_size; i++) {
+				page = queue->rx_buffers_page[i];
+				if (!page)
+					continue;
 
-		for (i = 0; i < bp->rx_ring_size; i++) {
-			skb = queue->rx_skbuff[i];
+				page_pool_put_full_page(queue->page_pool,
+							 page, false);
+			}
 
-			if (!skb)
-				continue;
-
-			desc = macb_rx_desc(queue, i);
-			addr = macb_get_addr(bp, desc);
-
-			dma_unmap_single(&bp->pdev->dev, addr, bp->rx_buffer_size,
-					DMA_FROM_DEVICE);
-			dev_kfree_skb_any(skb);
-			skb = NULL;
+			kfree(queue->rx_buffers_page);
+			queue->rx_buffers_page = NULL;
 		}
 
-		kfree(queue->rx_skbuff);
-		queue->rx_skbuff = NULL;
+		if (queue->page_pool) {
+			page_pool_destroy(queue->page_pool);
+			queue->page_pool = NULL;
+		}
 	}
 }
 
@@ -2824,18 +2828,43 @@ static void macb_free_consistent(struct macb *bp)
 static int gem_alloc_rx_buffers(struct macb *bp)
 {
 	struct macb_queue *queue;
+	struct page_pool *page_pool;
+	struct page_pool_params pp_params;
+	unsigned int page_pool_size;
 	unsigned int q;
 	int size;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		size = bp->rx_ring_size * sizeof(struct sk_buff *);
-		queue->rx_skbuff = kzalloc(size, GFP_KERNEL);
-		if (!queue->rx_skbuff)
+		size = bp->rx_ring_size * sizeof(struct page *);
+		queue->rx_buffers_page = kzalloc(size, GFP_KERNEL);
+		if (!queue->rx_buffers_page)
 			return -ENOMEM;
-		else
-			netdev_dbg(bp->dev,
-				   "Allocated %d RX struct sk_buff entries at %p\n",
-				   bp->rx_ring_size, queue->rx_skbuff);
+
+		page_pool_size = gem_rx_page_alloc_size(bp);
+		pp_params = (struct page_pool_params) {
+			.order = get_order(page_pool_size),
+			.pool_size = bp->rx_ring_size,
+			.nid = dev_to_node(&bp->pdev->dev),
+			.dev = &bp->pdev->dev,
+			.napi = &queue->napi_rx,
+			.dma_dir = DMA_FROM_DEVICE,
+			.max_len = bp->rx_buffer_size,
+			.offset = gem_rx_page_offset(),
+			.netdev = bp->dev,
+			.queue_idx = q,
+			.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		};
+
+		page_pool = page_pool_create(&pp_params);
+		if (IS_ERR(page_pool)) {
+			kfree(queue->rx_buffers_page);
+			queue->rx_buffers_page = NULL;
+			return PTR_ERR(page_pool);
+		}
+		queue->page_pool = page_pool;
+
+		netdev_dbg(bp->dev, "Allocated %d RX page entries at %p\n",
+			   bp->rx_ring_size, queue->rx_buffers_page);
 	}
 	return 0;
 }
