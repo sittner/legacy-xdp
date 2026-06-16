@@ -14,6 +14,7 @@
 #include <linux/interrupt.h>
 #include <linux/phy/phy.h>
 #include <linux/workqueue.h>
+#include <net/xdp.h>
 
 #if defined(CONFIG_ARCH_DMA_ADDR_T_64BIT) || defined(CONFIG_MACB_USE_HWSTAMP)
 #define MACB_EXT_DESC
@@ -997,6 +998,7 @@ struct macb_dma_desc_ptp {
  */
 struct macb_tx_skb {
 	struct sk_buff		*skb;
+	struct xdp_frame	*xdpf;
 	dma_addr_t		mapping;
 	size_t			size;
 	bool			mapped_as_page;
@@ -1316,6 +1318,7 @@ struct macb_queue {
 	struct macb_dma_desc	*rx_ring;
 	struct page		**rx_buffers_page;
 	struct page_pool	*page_pool;
+	struct xdp_rxq_info	xdp_rxq;
 	void			*rx_buffers;
 	struct napi_struct	napi_rx;
 	struct queue_stats stats;
@@ -1358,6 +1361,7 @@ struct macb {
 	struct clk		*rx_clk;
 	struct clk		*tsu_clk;
 	struct net_device	*dev;
+	struct bpf_prog __rcu	*xdp_prog;
 	/* Protects hw_stats and ethtool_stats */
 	spinlock_t		stats_lock;
 	union {
