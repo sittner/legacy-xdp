@@ -118,4 +118,57 @@ static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
 #define E1000E_CC_READ_CONST
 #endif
 
+/* page_pool headers were reorganised in Linux 6.6: the monolithic
+ * net/page_pool.h was split into net/page_pool/types.h, core.h and helpers.h.
+ * On older kernels include the original combined header.
+ *
+ * On kernels >= 6.6, net/page_pool/helpers.h transitively pulls in net/xdp.h
+ * (and thereby uapi/linux/bpf.h) which defines XDP_PACKET_HEADROOM.  The old
+ * net/page_pool.h does not, so provide the fallback define here.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+#include <net/page_pool/helpers.h>
+#else
+#include <net/page_pool.h>
+#ifndef XDP_PACKET_HEADROOM
+#define XDP_PACKET_HEADROOM 256
+#endif
+#endif
+
+/* page_pool_dma_sync_for_cpu() was introduced in Linux 6.6 (as part of the
+ * helpers.h split).  Provide an equivalent implementation on older kernels
+ * using dma_sync_single_range_for_cpu() directly.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,6,0)
+#include <linux/dma-mapping.h>
+static inline void page_pool_dma_sync_for_cpu(const struct page_pool *pool,
+					      const struct page *page,
+					      u32 offset, u32 dma_sync_size)
+{
+	/* Cast away const: the 6.1 page_pool_get_dma_addr() lacks the const
+	 * qualifier on its argument even though it only reads from the page.
+	 */
+	dma_sync_single_range_for_cpu(pool->p.dev,
+				      page_pool_get_dma_addr((struct page *)page),
+				      offset, dma_sync_size,
+				      pool->p.dma_dir);
+}
+#endif
+
+/* struct page_pool_params gained 'napi', 'netdev' and 'queue_idx' members in
+ * Linux 6.6 (as part of the struct_group_tagged fast/slow reorganisation).
+ * Guard these initializers on older kernels where the fields do not exist.
+ *
+ * E1000E_PAGE_POOL_NAPI_INIT expands to a designated-initializer fragment
+ * (including the trailing comma) so it can be used inside a compound literal.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+#define E1000E_PAGE_POOL_NAPI_INIT(napi_ptr)	.napi = (napi_ptr),
+#define E1000E_PAGE_POOL_SET_NETDEV(params, dev)	\
+	do { (params)->netdev = (dev); } while (0)
+#else
+#define E1000E_PAGE_POOL_NAPI_INIT(napi_ptr)
+#define E1000E_PAGE_POOL_SET_NETDEV(params, dev)	do { } while (0)
+#endif
+
 #endif /* _E1000E_COMPAT_H_ */
