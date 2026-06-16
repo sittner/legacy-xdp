@@ -639,53 +639,42 @@ static void e1000e_update_tdt_wa(struct e1000_ring *tx_ring, unsigned int i)
 }
 
 /**
- * e1000_alloc_rx_buffers - Replace used receive buffers
+ * e1000_alloc_rx_buffers - Replace used receive buffers (page_pool path)
  * @rx_ring: Rx descriptor ring
  * @cleaned_count: number to reallocate
- * @gfp: flags for allocation
+ * @gfp: flags for allocation (unused; page_pool always uses GFP_ATOMIC)
  **/
 static void e1000_alloc_rx_buffers(struct e1000_ring *rx_ring,
 				   int cleaned_count, gfp_t gfp)
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
-	struct net_device *netdev = adapter->netdev;
-	struct pci_dev *pdev = adapter->pdev;
 	union e1000_rx_desc_extended *rx_desc;
 	struct e1000_buffer *buffer_info;
-	struct sk_buff *skb;
+	struct page *page;
+	dma_addr_t dma;
 	unsigned int i;
-	unsigned int bufsz = adapter->rx_buffer_len;
 
 	i = rx_ring->next_to_use;
 	buffer_info = &rx_ring->buffer_info[i];
 
 	while (cleaned_count--) {
-		skb = buffer_info->skb;
-		if (skb) {
-			skb_trim(skb, 0);
-			goto map_skb;
-		}
+		/* Reuse the page already held in buffer_info if possible
+		 * (returned after a discard or error in e1000_clean_rx_irq).
+		 */
+		if (buffer_info->page)
+			goto write_desc;
 
-		skb = __netdev_alloc_skb_ip_align(netdev, bufsz, gfp);
-		if (!skb) {
-			/* Better luck next round */
+		page = page_pool_dev_alloc_pages(rx_ring->page_pool);
+		if (unlikely(!page)) {
 			adapter->alloc_rx_buff_failed++;
 			break;
 		}
-
-		buffer_info->skb = skb;
-map_skb:
-		buffer_info->dma = dma_map_single(&pdev->dev, skb->data,
-						  adapter->rx_buffer_len,
-						  DMA_FROM_DEVICE);
-		if (dma_mapping_error(&pdev->dev, buffer_info->dma)) {
-			dev_err(&pdev->dev, "Rx DMA map failed\n");
-			adapter->rx_dma_failed++;
-			break;
-		}
-
+		buffer_info->page = page;
+write_desc:
+		dma = page_pool_get_dma_addr(buffer_info->page) +
+		      E1000_RX_PAGE_OFFSET;
 		rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
-		rx_desc->read.buffer_addr = cpu_to_le64(buffer_info->dma);
+		rx_desc->read.buffer_addr = cpu_to_le64(dma);
 
 		if (unlikely(!(i & (E1000_RX_BUFFER_WRITE - 1)))) {
 			/* Force memory writes to complete before letting h/w
@@ -904,7 +893,7 @@ static inline void e1000_rx_hash(struct net_device *netdev, __le32 rss,
 }
 
 /**
- * e1000_clean_rx_irq - Send received data up the network stack
+ * e1000_clean_rx_irq - Send received data up the network stack (page_pool)
  * @rx_ring: Rx descriptor ring
  * @work_done: output parameter for indicating completed work
  * @work_to_do: how many packets we can clean
@@ -917,10 +906,10 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
-	struct pci_dev *pdev = adapter->pdev;
 	struct e1000_hw *hw = &adapter->hw;
 	union e1000_rx_desc_extended *rx_desc, *next_rxd;
 	struct e1000_buffer *buffer_info, *next_buffer;
+	struct page *page;
 	u32 length, staterr;
 	unsigned int i;
 	int cleaned_count = 0;
@@ -940,10 +929,10 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 		(*work_done)++;
 		dma_rmb();	/* read descriptor and rx_buffer_info after status DD */
 
-		skb = buffer_info->skb;
-		buffer_info->skb = NULL;
+		page = buffer_info->page;
+		buffer_info->page = NULL;
 
-		prefetch(skb->data - NET_IP_ALIGN);
+		prefetch(page_address(page) + E1000_RX_PAGE_OFFSET);
 
 		i++;
 		if (i == rx_ring->count)
@@ -955,9 +944,11 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 
 		cleaned = true;
 		cleaned_count++;
-		dma_unmap_single(&pdev->dev, buffer_info->dma,
-				 adapter->rx_buffer_len, DMA_FROM_DEVICE);
-		buffer_info->dma = 0;
+
+		/* Sync page for CPU access before reading packet data. */
+		page_pool_dma_sync_for_cpu(rx_ring->page_pool, page,
+					   E1000_RX_PAGE_OFFSET,
+					   adapter->rx_buffer_len);
 
 		length = le16_to_cpu(rx_desc->wb.upper.length);
 
@@ -973,8 +964,8 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 		if (adapter->flags2 & FLAG2_IS_DISCARDING) {
 			/* All receives must fit into a single buffer */
 			e_dbg("Receive packet consumed multiple buffers\n");
-			/* recycle */
-			buffer_info->skb = skb;
+			/* recycle page back to pool */
+			buffer_info->page = page;
 			if (staterr & E1000_RXD_STAT_EOP)
 				adapter->flags2 &= ~FLAG2_IS_DISCARDING;
 			goto next_desc;
@@ -982,8 +973,8 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 
 		if (unlikely((staterr & E1000_RXDEXT_ERR_FRAME_ERR_MASK) &&
 			     !(netdev->features & NETIF_F_RXALL))) {
-			/* recycle */
-			buffer_info->skb = skb;
+			/* recycle page back to pool */
+			buffer_info->page = page;
 			goto next_desc;
 		}
 
@@ -1002,28 +993,41 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 		total_rx_bytes += length;
 		total_rx_packets++;
 
-		/* code added for copybreak, this should improve
-		 * performance for small packets with large amounts
-		 * of reassembly being done in the stack
+		/* For small packets, copy the data into a fresh skb and
+		 * return the page immediately to the pool (copybreak).
 		 */
+		skb = NULL;
 		if (length < copybreak) {
-			struct sk_buff *new_skb =
-				napi_alloc_skb(&adapter->napi, length);
-			if (new_skb) {
-				skb_copy_to_linear_data_offset(new_skb,
-							       -NET_IP_ALIGN,
-							       (skb->data -
-								NET_IP_ALIGN),
-							       (length +
-								NET_IP_ALIGN));
-				/* save the skb in buffer_info as good */
-				buffer_info->skb = skb;
-				skb = new_skb;
+			skb = napi_alloc_skb(&adapter->napi, length);
+			if (likely(skb)) {
+				skb_copy_to_linear_data_offset(
+					skb, -NET_IP_ALIGN,
+					page_address(page) +
+					    E1000_RX_PAGE_OFFSET - NET_IP_ALIGN,
+					length + NET_IP_ALIGN);
+				page_pool_put_full_page(rx_ring->page_pool,
+							page, false);
+				page = NULL;
+				skb_put(skb, length);
 			}
-			/* else just continue with the old one */
+			/* else fall through to napi_build_skb below */
 		}
-		/* end copybreak code */
-		skb_put(skb, length);
+
+		if (!skb) {
+			/* Build an skb directly from the page_pool page.
+			 * skb_mark_for_recycle() will return the page to the
+			 * pool automatically when the skb is freed.
+			 */
+			skb = napi_build_skb(page_address(page), PAGE_SIZE);
+			if (unlikely(!skb)) {
+				page_pool_put_full_page(rx_ring->page_pool,
+							page, false);
+				goto next_desc;
+			}
+			skb_reserve(skb, E1000_RX_PAGE_OFFSET);
+			skb_put(skb, length);
+			skb_mark_for_recycle(skb);
+		}
 
 		/* Receive Checksum Offload */
 		e1000_rx_checksum(adapter, staterr, skb);
@@ -1677,32 +1681,43 @@ static void e1000_clean_rx_ring(struct e1000_ring *rx_ring)
 	struct pci_dev *pdev = adapter->pdev;
 	unsigned int i, j;
 
-	/* Free all the Rx ring sk_buffs */
+	/* Free all the Rx ring sk_buffs / pages */
 	for (i = 0; i < rx_ring->count; i++) {
 		buffer_info = &rx_ring->buffer_info[i];
-		if (buffer_info->dma) {
-			if (adapter->clean_rx == e1000_clean_rx_irq)
-				dma_unmap_single(&pdev->dev, buffer_info->dma,
-						 adapter->rx_buffer_len,
-						 DMA_FROM_DEVICE);
-			else if (adapter->clean_rx == e1000_clean_jumbo_rx_irq)
-				dma_unmap_page(&pdev->dev, buffer_info->dma,
-					       PAGE_SIZE, DMA_FROM_DEVICE);
-			else if (adapter->clean_rx == e1000_clean_rx_irq_ps)
-				dma_unmap_single(&pdev->dev, buffer_info->dma,
-						 adapter->rx_ps_bsize0,
-						 DMA_FROM_DEVICE);
-			buffer_info->dma = 0;
-		}
 
-		if (buffer_info->page) {
-			put_page(buffer_info->page);
-			buffer_info->page = NULL;
-		}
+		if (adapter->clean_rx == e1000_clean_rx_irq) {
+			/* page_pool path: return page to the pool */
+			if (buffer_info->page) {
+				page_pool_put_full_page(rx_ring->page_pool,
+							buffer_info->page,
+							false);
+				buffer_info->page = NULL;
+			}
+		} else {
+			/* jumbo and PS paths: use the old DMA/page cleanup */
+			if (buffer_info->dma) {
+				if (adapter->clean_rx == e1000_clean_jumbo_rx_irq)
+					dma_unmap_page(&pdev->dev,
+						       buffer_info->dma,
+						       PAGE_SIZE,
+						       DMA_FROM_DEVICE);
+				else if (adapter->clean_rx == e1000_clean_rx_irq_ps)
+					dma_unmap_single(&pdev->dev,
+							 buffer_info->dma,
+							 adapter->rx_ps_bsize0,
+							 DMA_FROM_DEVICE);
+				buffer_info->dma = 0;
+			}
 
-		if (buffer_info->skb) {
-			dev_kfree_skb(buffer_info->skb);
-			buffer_info->skb = NULL;
+			if (buffer_info->page) {
+				put_page(buffer_info->page);
+				buffer_info->page = NULL;
+			}
+
+			if (buffer_info->skb) {
+				dev_kfree_skb(buffer_info->skb);
+				buffer_info->skb = NULL;
+			}
 		}
 
 		for (j = 0; j < PS_PAGE_BUFFERS; j++) {
@@ -2359,13 +2374,34 @@ err:
 int e1000e_setup_rx_resources(struct e1000_ring *rx_ring)
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
+	struct page_pool_params pp_params = {
+		.flags    = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		.order    = 0,
+		.pool_size = rx_ring->count,
+		.nid      = NUMA_NO_NODE,
+		.dev      = &adapter->pdev->dev,
+		.napi     = &adapter->napi,
+		.dma_dir  = DMA_FROM_DEVICE,
+		.max_len  = PAGE_SIZE,
+		.offset   = E1000_RX_PAGE_OFFSET,
+	};
 	struct e1000_buffer *buffer_info;
 	int i, size, desc_len, err = -ENOMEM;
+
+	E1000E_PAGE_POOL_SET_NETDEV(&pp_params, adapter->netdev);
+
+	rx_ring->page_pool = page_pool_create(&pp_params);
+	if (IS_ERR(rx_ring->page_pool)) {
+		err = PTR_ERR(rx_ring->page_pool);
+		rx_ring->page_pool = NULL;
+		e_err("Failed to create page_pool for rx_ring\n");
+		return err;
+	}
 
 	size = sizeof(struct e1000_buffer) * rx_ring->count;
 	rx_ring->buffer_info = vzalloc(size);
 	if (!rx_ring->buffer_info)
-		goto err;
+		goto err_buf;
 
 	for (i = 0; i < rx_ring->count; i++) {
 		buffer_info = &rx_ring->buffer_info[i];
@@ -2396,8 +2432,11 @@ err_pages:
 		buffer_info = &rx_ring->buffer_info[i];
 		kfree(buffer_info->ps_pages);
 	}
-err:
 	vfree(rx_ring->buffer_info);
+	rx_ring->buffer_info = NULL;
+err_buf:
+	page_pool_destroy(rx_ring->page_pool);
+	rx_ring->page_pool = NULL;
 	e_err("Unable to allocate memory for the receive descriptor ring\n");
 	return err;
 }
@@ -2472,6 +2511,11 @@ void e1000e_free_rx_resources(struct e1000_ring *rx_ring)
 	dma_free_coherent(&pdev->dev, rx_ring->size, rx_ring->desc,
 			  rx_ring->dma);
 	rx_ring->desc = NULL;
+
+	if (rx_ring->page_pool) {
+		page_pool_destroy(rx_ring->page_pool);
+		rx_ring->page_pool = NULL;
+	}
 }
 
 /**

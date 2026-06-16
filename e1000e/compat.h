@@ -118,4 +118,15 @@ static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
 #define E1000E_CC_READ_CONST
 #endif
 
+/* struct page_pool_params gained 'netdev' and 'queue_idx' members in Linux
+ * 6.6 (inside a struct_group_tagged 'slow' section used for pool statistics).
+ * Guard these initializers on older kernels where the fields do not exist.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
+#define E1000E_PAGE_POOL_SET_NETDEV(params, dev)	\
+	do { (params)->netdev = (dev); } while (0)
+#else
+#define E1000E_PAGE_POOL_SET_NETDEV(params, dev)	do { } while (0)
+#endif
+
 #endif /* _E1000E_COMPAT_H_ */

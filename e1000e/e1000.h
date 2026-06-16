@@ -23,6 +23,7 @@
 #include <linux/mdio.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
+#include <net/page_pool/helpers.h>
 #include "hw.h"
 #include "compat.h"
 
@@ -152,6 +153,13 @@ struct e1000_buffer {
 	};
 };
 
+/*
+ * Per-page headroom reserved before packet data for the normal (non-jumbo,
+ * non-PS) RX path when using page_pool.  Using XDP_PACKET_HEADROOM so the
+ * layout is XDP-ready when XDP support is added later.
+ */
+#define E1000_RX_PAGE_OFFSET	(XDP_PACKET_HEADROOM + NET_IP_ALIGN)
+
 struct e1000_ring {
 	struct e1000_adapter *adapter;	/* back pointer to adapter */
 	void *desc;			/* pointer to ring memory  */
@@ -175,6 +183,9 @@ struct e1000_ring {
 	int set_itr;
 
 	struct sk_buff *rx_skb_top;
+
+	/* page_pool for the normal (non-jumbo, non-PS) RX path */
+	struct page_pool *page_pool;
 };
 
 /* PHY register snapshot values */
