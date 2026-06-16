@@ -2716,7 +2716,7 @@ static int macb_xdp_queue_one(struct macb *bp, struct macb_queue *queue,
 	if (unlikely(!len || len > bp->max_tx_length))
 		return -EINVAL;
 
-	if (CIRC_SPACE(queue->tx_head, queue->tx_tail, bp->tx_ring_size) < 1)
+	if (CIRC_SPACE(queue->tx_head, queue->tx_tail, bp->tx_ring_size) < 2)
 		return -EBUSY;
 
 	entry = macb_tx_ring_wrap(bp, queue->tx_head);
@@ -2746,6 +2746,10 @@ static int macb_xdp_queue_one(struct macb *bp, struct macb_queue *queue,
 		page_offset = (unsigned long)xdpf->data -
 			      (unsigned long)page_address(page);
 		mapping = page_pool_get_dma_addr(page) + page_offset;
+		/* RX page_pool pages are already DMA-mapped; keep mapping at 0
+		 * so macb_tx_unmap() skips dma_unmap_single() and hands the
+		 * frame back through xdp_return_frame().
+		 */
 		tx_skb->mapping = 0;
 	}
 
@@ -2777,7 +2781,7 @@ static int macb_xdp_xmit_back(struct macb *bp, struct xdp_buff *xdp)
 		return -ENOMEM;
 
 	spin_lock_irqsave(&queue->tx_ptr_lock, flags);
-	ret = macb_xdp_queue_one(bp, queue, xdpf, true);
+	ret = macb_xdp_queue_one(bp, queue, xdpf, false);
 	spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
 	if (ret) {
 		xdp_return_frame(xdpf);
