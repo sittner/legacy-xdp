@@ -153,9 +153,9 @@ struct e1000_buffer {
 };
 
 /*
- * Per-page headroom reserved before packet data for the normal (non-jumbo,
- * non-PS) RX path when using page_pool.  Using XDP_PACKET_HEADROOM so the
- * layout is XDP-ready when XDP support is added later.
+ * Per-page headroom reserved before packet data for page_pool RX paths
+ * (normal and jumbo, but not packet-split/PS). Using XDP_PACKET_HEADROOM so
+ * the layout is XDP-ready when XDP support is added later.
  */
 #define E1000_RX_PAGE_OFFSET	(XDP_PACKET_HEADROOM + NET_IP_ALIGN)
 
@@ -183,7 +183,7 @@ struct e1000_ring {
 
 	struct sk_buff *rx_skb_top;
 
-	/* page_pool for the normal (non-jumbo, non-PS) RX path */
+	/* page_pool for normal/jumbo RX paths (PS remains legacy DMA) */
 	struct page_pool *page_pool;
 };
 
