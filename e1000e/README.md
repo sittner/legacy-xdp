@@ -13,10 +13,9 @@ in the Linux kernel tree (`torvalds/linux`, tag `v6.15`).
 
 ## Purpose
 
-This is the **baseline extraction** — no source modifications have been made.
-The goal is to add **native XDP support** to the e1000e driver in a subsequent
-step, following the same approach used in the sibling `macb-xdp` driver in
-the parent directory.
+This out-of-tree driver now includes **native XDP support** for kernels
+6.1 through 6.18+, following the same approach used in the sibling `macb-xdp`
+driver in the parent directory.
 
 ### Why native XDP for e1000e?
 
@@ -70,9 +69,8 @@ sudo modprobe e1000e
 
 **Linux 6.1 – 6.18+**
 
-The driver source is from v6.15. A `compat.h` shim will be added in a
-subsequent commit when XDP modifications are introduced, to handle any
-API differences across the 6.1–6.18 range.
+The driver source is from v6.15, with local XDP and compat-layer updates
+to handle API differences across the 6.1–6.18 range.
 
 ## Source Files
 

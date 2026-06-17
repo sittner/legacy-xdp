@@ -15,8 +15,11 @@
 #include <linux/tcp.h>
 #include <linux/ipv6.h>
 #include <linux/slab.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
 #include <net/checksum.h>
 #include <net/ip6_checksum.h>
+#include <net/xdp.h>
 #include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/cpu.h>
@@ -25,6 +28,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/prefetch.h>
 #include <linux/suspend.h>
+#include <trace/events/xdp.h>
 
 #include "e1000.h"
 #define CREATE_TRACE_POINTS
@@ -638,6 +642,123 @@ static void e1000e_update_tdt_wa(struct e1000_ring *tx_ring, unsigned int i)
 	}
 }
 
+static int e1000e_xdp_queue_one(struct e1000_adapter *adapter,
+				struct xdp_frame *xdpf, bool dma_map)
+{
+	struct e1000_ring *tx_ring = adapter->tx_ring;
+	struct e1000_buffer *buffer_info;
+	struct e1000_tx_desc *tx_desc;
+	dma_addr_t dma;
+	unsigned int i;
+
+	if (unlikely(xdp_frame_has_frags(xdpf)))
+		return -EOPNOTSUPP;
+
+	if (unlikely(!xdpf->len || xdpf->len > adapter->tx_fifo_limit))
+		return -EINVAL;
+
+	if (unlikely(e1000_desc_unused(tx_ring) < 1))
+		return -EBUSY;
+
+	i = tx_ring->next_to_use;
+	buffer_info = &tx_ring->buffer_info[i];
+
+	if (dma_map) {
+		dma = dma_map_single(&adapter->pdev->dev, xdpf->data, xdpf->len,
+				     DMA_TO_DEVICE);
+		if (dma_mapping_error(&adapter->pdev->dev, dma))
+			return -ENOMEM;
+		buffer_info->dma = dma;
+	} else {
+		struct page *page = virt_to_head_page(xdpf->data);
+		unsigned long page_offset;
+
+		page_offset = (unsigned long)xdpf->data -
+			      (unsigned long)page_address(page);
+		dma = page_pool_get_dma_addr(page) + page_offset;
+		buffer_info->dma = 0;
+	}
+
+	buffer_info->mapped_as_page = false;
+	buffer_info->length = xdpf->len;
+	buffer_info->time_stamp = jiffies;
+	buffer_info->next_to_watch = i;
+	buffer_info->segs = 1;
+	buffer_info->bytecount = xdpf->len;
+	buffer_info->skb = NULL;
+	buffer_info->xdpf = xdpf;
+
+	tx_desc = E1000_TX_DESC(*tx_ring, i);
+	tx_desc->buffer_addr = cpu_to_le64(dma);
+	tx_desc->lower.data = cpu_to_le32(adapter->txd_cmd | xdpf->len);
+	tx_desc->upper.data = 0;
+
+	i++;
+	if (i == tx_ring->count)
+		i = 0;
+	tx_ring->next_to_use = i;
+	netdev_tx_sent_queue(netdev_get_tx_queue(adapter->netdev, 0), xdpf->len);
+
+	return 0;
+}
+
+static void e1000e_xdp_kick_tx(struct e1000_adapter *adapter)
+{
+	struct e1000_ring *tx_ring = adapter->tx_ring;
+
+	wmb();
+	if (adapter->flags2 & FLAG2_PCIM2PCI_ARBITER_WA)
+		e1000e_update_tdt_wa(tx_ring, tx_ring->next_to_use);
+	else
+		writel(tx_ring->next_to_use, tx_ring->tail);
+}
+
+static int e1000e_xdp_xmit_back(struct e1000_adapter *adapter,
+				struct xdp_buff *xdp)
+{
+	struct netdev_queue *nq = netdev_get_tx_queue(adapter->netdev, 0);
+	struct xdp_frame *xdpf;
+	int err;
+
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (unlikely(!xdpf))
+		return -ENOMEM;
+
+	__netif_tx_lock_bh(nq);
+	err = e1000e_xdp_queue_one(adapter, xdpf, false);
+	if (!err)
+		e1000e_xdp_kick_tx(adapter);
+	__netif_tx_unlock_bh(nq);
+
+	return err;
+}
+
+static int e1000e_xdp_xmit(struct net_device *dev, int n,
+			   struct xdp_frame **frames, u32 flags)
+{
+	struct e1000_adapter *adapter = netdev_priv(dev);
+	struct netdev_queue *nq = netdev_get_tx_queue(dev, 0);
+	int i, nxmit = 0;
+	int err;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	__netif_tx_lock_bh(nq);
+	for (i = 0; i < n; i++) {
+		err = e1000e_xdp_queue_one(adapter, frames[i], true);
+		if (err)
+			break;
+		nxmit++;
+	}
+
+	if (nxmit)
+		e1000e_xdp_kick_tx(adapter);
+	__netif_tx_unlock_bh(nq);
+
+	return nxmit;
+}
+
 /**
  * e1000_alloc_rx_buffers - Replace used receive buffers (page_pool path)
  * @rx_ring: Rx descriptor ring
@@ -903,6 +1024,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
 	struct e1000_hw *hw = &adapter->hw;
+	struct bpf_prog *prog;
 	union e1000_rx_desc_extended *rx_desc, *next_rxd;
 	struct e1000_buffer *buffer_info, *next_buffer;
 	struct page *page;
@@ -910,15 +1032,19 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 	unsigned int i;
 	int cleaned_count = 0;
 	bool cleaned = false;
+	bool xdp_redirect = false;
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
 
 	i = rx_ring->next_to_clean;
 	rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
 	staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
 	buffer_info = &rx_ring->buffer_info[i];
+	rcu_read_lock();
+	prog = rcu_dereference(adapter->xdp_prog);
 
 	while (staterr & E1000_RXD_STAT_DD) {
 		struct sk_buff *skb;
+		unsigned int headroom = E1000_RX_PAGE_OFFSET;
 
 		if (*work_done >= work_to_do)
 			break;
@@ -947,6 +1073,43 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 					   adapter->rx_buffer_len);
 
 		length = le16_to_cpu(rx_desc->wb.upper.length);
+
+		if (prog) {
+			struct xdp_buff xdp;
+			u32 act;
+
+			xdp_init_buff(&xdp, PAGE_SIZE, &adapter->xdp_rxq);
+			xdp_prepare_buff(&xdp, page_address(page),
+					 E1000_RX_PAGE_OFFSET, length, false);
+
+			act = bpf_prog_run_xdp(prog, &xdp);
+			switch (act) {
+			case XDP_PASS:
+				length = xdp.data_end - xdp.data;
+				headroom = xdp.data - xdp.data_hard_start;
+				break;
+			case XDP_DROP:
+				xdp_return_buff(&xdp);
+				goto next_desc;
+			case XDP_TX:
+				if (e1000e_xdp_xmit_back(adapter, &xdp))
+					xdp_return_buff(&xdp);
+				goto next_desc;
+			case XDP_REDIRECT:
+				if (xdp_do_redirect(netdev, &xdp, prog))
+					xdp_return_buff(&xdp);
+				else
+					xdp_redirect = true;
+				goto next_desc;
+			default:
+				bpf_warn_invalid_xdp_action(netdev, prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+				trace_xdp_exception(netdev, prog, act);
+				xdp_return_buff(&xdp);
+				goto next_desc;
+			}
+		}
 
 		/* !EOP means multiple descriptors were used to store a single
 		 * packet, if that's the case we need to toss it.  In fact, we
@@ -999,7 +1162,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 				skb_copy_to_linear_data_offset(
 					skb, -NET_IP_ALIGN,
 					page_address(page) +
-					    E1000_RX_PAGE_OFFSET - NET_IP_ALIGN,
+					    headroom - NET_IP_ALIGN,
 					length + NET_IP_ALIGN);
 				page_pool_put_full_page(rx_ring->page_pool,
 							page, false);
@@ -1020,7 +1183,7 @@ static bool e1000_clean_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 							page, false);
 				goto next_desc;
 			}
-			skb_reserve(skb, E1000_RX_PAGE_OFFSET);
+			skb_reserve(skb, headroom);
 			skb_put(skb, length);
 			skb_mark_for_recycle(skb);
 		}
@@ -1049,6 +1212,9 @@ next_desc:
 
 		staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
 	}
+	if (xdp_redirect)
+		xdp_do_flush();
+	rcu_read_unlock();
 	rx_ring->next_to_clean = i;
 
 	cleaned_count = e1000_desc_unused(rx_ring);
@@ -1081,6 +1247,10 @@ static void e1000_put_txbuf(struct e1000_ring *tx_ring,
 		else
 			dev_consume_skb_any(buffer_info->skb);
 		buffer_info->skb = NULL;
+	}
+	if (buffer_info->xdpf) {
+		xdp_return_frame(buffer_info->xdpf);
+		buffer_info->xdpf = NULL;
 	}
 	buffer_info->time_stamp = 0;
 }
@@ -1244,6 +1414,9 @@ static bool e1000_clean_tx_irq(struct e1000_ring *tx_ring)
 				total_tx_bytes += buffer_info->bytecount;
 				if (buffer_info->skb) {
 					bytes_compl += buffer_info->skb->len;
+					pkts_compl++;
+				} else if (buffer_info->xdpf) {
+					bytes_compl += buffer_info->xdpf->len;
 					pkts_compl++;
 				}
 			}
@@ -1513,12 +1686,14 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 {
 	struct e1000_adapter *adapter = rx_ring->adapter;
 	struct net_device *netdev = adapter->netdev;
+	struct bpf_prog *prog;
 	union e1000_rx_desc_extended *rx_desc, *next_rxd;
 	struct e1000_buffer *buffer_info, *next_buffer;
 	u32 length, staterr;
 	unsigned int i;
 	int cleaned_count = 0;
 	bool cleaned = false;
+	bool xdp_redirect = false;
 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
 	struct skb_shared_info *shinfo;
 
@@ -1526,6 +1701,8 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 	rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
 	staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
 	buffer_info = &rx_ring->buffer_info[i];
+	rcu_read_lock();
+	prog = rcu_dereference(adapter->xdp_prog);
 
 	while (staterr & E1000_RXD_STAT_DD) {
 		struct sk_buff *skb;
@@ -1554,6 +1731,85 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
 					   PAGE_SIZE - E1000_RX_PAGE_OFFSET);
 
 		length = le16_to_cpu(rx_desc->wb.upper.length);
+
+		if (prog) {
+			unsigned int headroom = E1000_RX_PAGE_OFFSET;
+			struct sk_buff *xdp_skb;
+			struct xdp_buff xdp;
+			u32 act;
+
+			if (unlikely(!(staterr & E1000_RXD_STAT_EOP)))
+				adapter->flags2 |= FLAG2_IS_DISCARDING;
+
+			if (unlikely(rx_ring->rx_skb_top ||
+				     (adapter->flags2 & FLAG2_IS_DISCARDING))) {
+				if (rx_ring->rx_skb_top) {
+					dev_kfree_skb_irq(rx_ring->rx_skb_top);
+					rx_ring->rx_skb_top = NULL;
+				}
+				if (staterr & E1000_RXD_STAT_EOP)
+					adapter->flags2 &= ~FLAG2_IS_DISCARDING;
+				buffer_info->skb = skb;
+				goto next_desc;
+			}
+
+			xdp_init_buff(&xdp, PAGE_SIZE, &adapter->xdp_rxq);
+			xdp_prepare_buff(&xdp, page_address(buffer_info->page),
+					 E1000_RX_PAGE_OFFSET, length, false);
+
+			act = bpf_prog_run_xdp(prog, &xdp);
+			switch (act) {
+			case XDP_PASS:
+				length = xdp.data_end - xdp.data;
+				headroom = xdp.data - xdp.data_hard_start;
+				break;
+			case XDP_DROP:
+				xdp_return_buff(&xdp);
+				buffer_info->page = NULL;
+				buffer_info->skb = skb;
+				goto next_desc;
+			case XDP_TX:
+				if (e1000e_xdp_xmit_back(adapter, &xdp))
+					xdp_return_buff(&xdp);
+				buffer_info->page = NULL;
+				buffer_info->skb = skb;
+				goto next_desc;
+			case XDP_REDIRECT:
+				if (xdp_do_redirect(netdev, &xdp, prog))
+					xdp_return_buff(&xdp);
+				else
+					xdp_redirect = true;
+				buffer_info->page = NULL;
+				buffer_info->skb = skb;
+				goto next_desc;
+			default:
+				bpf_warn_invalid_xdp_action(netdev, prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+				trace_xdp_exception(netdev, prog, act);
+				xdp_return_buff(&xdp);
+				buffer_info->page = NULL;
+				buffer_info->skb = skb;
+				goto next_desc;
+			}
+
+			xdp_skb = napi_build_skb(page_address(buffer_info->page),
+						 PAGE_SIZE);
+			if (unlikely(!xdp_skb)) {
+				xdp_return_buff(&xdp);
+				buffer_info->page = NULL;
+				buffer_info->skb = skb;
+				goto next_desc;
+			}
+
+			skb_reserve(xdp_skb, headroom);
+			skb_put(xdp_skb, length);
+			skb_mark_for_recycle(xdp_skb);
+
+			buffer_info->page = NULL;
+			buffer_info->skb = skb;
+			skb = xdp_skb;
+		}
 
 		/* errors is only valid for DD + EOP descriptors */
 		if (unlikely((staterr & E1000_RXD_STAT_EOP) &&
@@ -1660,6 +1916,9 @@ next_desc:
 
 		staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
 	}
+	if (xdp_redirect)
+		xdp_do_flush();
+	rcu_read_unlock();
 	rx_ring->next_to_clean = i;
 
 	cleaned_count = e1000_desc_unused(rx_ring);
@@ -3482,6 +3741,54 @@ static void e1000e_set_rx_mode(struct net_device *netdev)
 		e1000e_vlan_strip_disable(adapter);
 }
 
+static int e1000e_xdp(struct net_device *dev, struct netdev_bpf *bpf)
+{
+	struct e1000_adapter *adapter = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+
+	switch (bpf->command) {
+	case XDP_SETUP_PROG:
+		if (bpf->prog && adapter->rx_ps_pages) {
+			NL_SET_ERR_MSG_MOD(bpf->extack,
+					   "XDP not supported with packet-split RX mode");
+			return -EOPNOTSUPP;
+		}
+
+		old_prog = rtnl_dereference(adapter->xdp_prog);
+		rcu_assign_pointer(adapter->xdp_prog, bpf->prog);
+		if (old_prog)
+			bpf_prog_put(old_prog);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int e1000e_xdp_rxq_register(struct e1000_adapter *adapter)
+{
+	struct e1000_ring *rx_ring = adapter->rx_ring;
+	int err;
+
+	err = xdp_rxq_info_reg(&adapter->xdp_rxq, adapter->netdev, 0,
+			       adapter->napi.napi_id);
+	if (err)
+		return err;
+
+	err = xdp_rxq_info_reg_mem_model(&adapter->xdp_rxq,
+					 MEM_TYPE_PAGE_POOL,
+					 rx_ring->page_pool);
+	if (err)
+		xdp_rxq_info_unreg(&adapter->xdp_rxq);
+
+	return err;
+}
+
+static void e1000e_xdp_rxq_unregister(struct e1000_adapter *adapter)
+{
+	if (xdp_rxq_info_is_reg(&adapter->xdp_rxq))
+		xdp_rxq_info_unreg(&adapter->xdp_rxq);
+}
+
 static void e1000e_setup_rss_hash(struct e1000_adapter *adapter)
 {
 	struct e1000_hw *hw = &adapter->hw;
@@ -4743,6 +5050,10 @@ int e1000e_open(struct net_device *netdev)
 	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_RX, &adapter->napi);
 	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_TX, &adapter->napi);
 
+	err = e1000e_xdp_rxq_register(adapter);
+	if (err)
+		goto err_xdp_rxq;
+
 	e1000_irq_enable(adapter);
 
 	adapter->tx_hang_recheck = false;
@@ -4754,7 +5065,14 @@ int e1000e_open(struct net_device *netdev)
 
 	return 0;
 
+err_xdp_rxq:
+	set_bit(__E1000_DOWN, &adapter->state);
+	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_RX, NULL);
+	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_TX, NULL);
+	napi_disable(&adapter->napi);
+	e1000_free_irq(adapter);
 err_req_irq:
+	e1000e_xdp_rxq_unregister(adapter);
 	cpu_latency_qos_remove_request(&adapter->pm_qos_req);
 	e1000e_release_hw_control(adapter);
 	e1000_power_down_phy(adapter);
@@ -4803,6 +5121,7 @@ int e1000e_close(struct net_device *netdev)
 	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_RX, NULL);
 	netif_queue_set_napi(netdev, 0, NETDEV_QUEUE_TYPE_TX, NULL);
 	napi_disable(&adapter->napi);
+	e1000e_xdp_rxq_unregister(adapter);
 
 	e1000e_free_tx_resources(adapter->tx_ring);
 	e1000e_free_rx_resources(adapter->rx_ring);
@@ -7423,6 +7742,8 @@ static const struct net_device_ops e1000e_netdev_ops = {
 	.ndo_set_features	= e1000_set_features,
 	.ndo_fix_features	= e1000_fix_features,
 	.ndo_features_check	= passthru_features_check,
+	.ndo_bpf		= e1000e_xdp,
+	.ndo_xdp_xmit		= e1000e_xdp_xmit,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
 	.ndo_hwtstamp_get	= e1000e_hwtstamp_get,
 	.ndo_hwtstamp_set	= e1000e_hwtstamp_set,

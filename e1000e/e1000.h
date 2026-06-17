@@ -23,6 +23,8 @@
 #include <linux/mdio.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
+#include <linux/filter.h>
+#include <net/xdp.h>
 #include "hw.h"
 #include "compat.h"
 
@@ -133,6 +135,7 @@ struct e1000_ps_page {
 struct e1000_buffer {
 	dma_addr_t dma;
 	struct sk_buff *skb;
+	struct xdp_frame *xdpf;
 	union {
 		/* Tx */
 		struct {
@@ -232,6 +235,8 @@ struct e1000_adapter {
 	u32 tx_fifo_limit;
 
 	struct napi_struct napi;
+	struct bpf_prog __rcu *xdp_prog;
+	struct xdp_rxq_info xdp_rxq;
 
 	unsigned int uncorr_errors;	/* uncorrectable ECC errors */
 	unsigned int corr_errors;	/* correctable ECC errors */

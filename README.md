@@ -14,6 +14,9 @@ Based on the upstream driver from
   (`XDP_PASS`, `XDP_DROP`, `XDP_TX`, `XDP_ABORTED`).
 - **XDP redirect** — `.ndo_xdp_xmit` for `XDP_REDIRECT` from other devices
   and cross-device forwarding.
+- **e1000e parity** — the sibling `e1000e/` out-of-tree driver now also has
+  native XDP wiring (`ndo_bpf`, RX XDP execution, `XDP_TX`/`XDP_REDIRECT`,
+  and `xdp_rxq_info` registration).
 
 ## Build
 
