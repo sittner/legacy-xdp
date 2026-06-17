@@ -127,6 +127,26 @@ static inline u64 adjust_by_scaled_ppm(u64 base, long scaled_ppm)
  * PHY / EEE helpers
  * ──────────────────────────────────────────────────────────────────────────── */
 
+/* rgmii_clock() was introduced in 6.13 to map link speed to RGMII clock
+ * rates.  Provide an equivalent for older kernels.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
+#include <linux/phy.h>
+static inline long rgmii_clock(int speed)
+{
+	switch (speed) {
+	case SPEED_10:
+		return 2500000;
+	case SPEED_100:
+		return 25000000;
+	case SPEED_1000:
+		return 125000000;
+	default:
+		return -EINVAL;
+	}
+}
+#endif
+
 /* phy_disable_eee_mode() was introduced in 6.18 to clear a single EEE link
  * mode from the PHY's advertised set.  On older kernels manipulate
  * advertising_eee directly.
@@ -138,6 +158,20 @@ static inline void phy_disable_eee_mode(struct phy_device *phydev,
 {
 	linkmode_clear_bit(link_mode, phydev->advertising_eee);
 }
+#endif
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Phylink helpers (6.13+ API changes)
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/* pcs_get_state() gained an 'unsigned int neg_mode' parameter in 6.13.
+ * Use these macros in function signatures and ops tables so the same
+ * source compiles on both old and new kernels.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
+#define OOT_PCS_GET_STATE_NEG_MODE_ARG	unsigned int neg_mode,
+#else
+#define OOT_PCS_GET_STATE_NEG_MODE_ARG
 #endif
 
 /* ────────────────────────────────────────────────────────────────────────────

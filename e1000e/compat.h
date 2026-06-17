@@ -18,11 +18,11 @@
 #define E1000E_SYSVAL_USES_CS_PTR 1
 #endif
 
-/* struct cyclecounter's .read callback dropped its 'const' qualifier in 6.12.
+/* struct cyclecounter's .read callback dropped its 'const' qualifier in 6.13.
  * Use this macro in the function signature so it always matches what the
  * kernel expects on each version.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,12,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,13,0)
 #define E1000E_CC_READ_CONST const
 #else
 #define E1000E_CC_READ_CONST

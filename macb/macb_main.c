@@ -44,7 +44,6 @@
 #include <linux/gcd.h>
 #include <net/pkt_sched.h>
 #include <net/xdp.h>
-#include "compat.h"
 #include "macb.h"
 
 static unsigned int txdelay = 35;
@@ -586,7 +585,7 @@ static void macb_usx_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
 }
 
 static void macb_usx_pcs_get_state(struct phylink_pcs *pcs,
-				   unsigned int neg_mode,
+				   OOT_PCS_GET_STATE_NEG_MODE_ARG
 				   struct phylink_link_state *state)
 {
 	struct macb *bp = container_of(pcs, struct macb, phylink_usx_pcs);
@@ -617,7 +616,8 @@ static int macb_usx_pcs_config(struct phylink_pcs *pcs,
 	return 0;
 }
 
-static void macb_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
+static void macb_pcs_get_state(struct phylink_pcs *pcs,
+			       OOT_PCS_GET_STATE_NEG_MODE_ARG
 			       struct phylink_link_state *state)
 {
 	state->link = 0;
@@ -716,6 +716,7 @@ static void macb_tx_lpi_wake(struct macb *bp)
 	udelay(50);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 static void macb_mac_disable_tx_lpi(struct phylink_config *config)
 {
 	struct net_device *ndev = to_net_dev(config->dev);
@@ -749,6 +750,7 @@ static int macb_mac_enable_tx_lpi(struct phylink_config *config, u32 timer,
 
 	return 0;
 }
+#endif
 
 static void macb_mac_config(struct phylink_config *config, unsigned int mode,
 			    const struct phylink_link_state *state)
@@ -1005,8 +1007,10 @@ static const struct phylink_mac_ops macb_phylink_ops = {
 	.mac_config = macb_mac_config,
 	.mac_link_down = macb_mac_link_down,
 	.mac_link_up = macb_mac_link_up,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 	.mac_disable_tx_lpi = macb_mac_disable_tx_lpi,
 	.mac_enable_tx_lpi = macb_mac_enable_tx_lpi,
+#endif
 };
 
 static bool macb_phy_handle_exists(struct device_node *dn)
@@ -1104,6 +1108,7 @@ static int macb_mii_probe(struct net_device *dev)
 
 	/* Configure EEE LPI if supported */
 	if (bp->caps & MACB_CAPS_EEE) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 		__set_bit(PHY_INTERFACE_MODE_MII,
 			  bp->phylink_config.lpi_interfaces);
 		__set_bit(PHY_INTERFACE_MODE_GMII,
@@ -1112,6 +1117,7 @@ static int macb_mii_probe(struct net_device *dev)
 		bp->phylink_config.lpi_capabilities = MAC_100FD | MAC_1000FD;
 		bp->phylink_config.lpi_timer_default = 250000;
 		bp->phylink_config.eee_enabled_default = true;
+#endif
 	}
 
 	bp->phylink = phylink_create(&bp->phylink_config, bp->pdev->dev.fwnode,
