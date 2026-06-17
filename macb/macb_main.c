@@ -42,9 +42,9 @@
 #include <linux/types.h>
 #include <linux/udp.h>
 #include <linux/gcd.h>
-#include <net/page_pool/helpers.h>
 #include <net/pkt_sched.h>
 #include <net/xdp.h>
+#include "compat.h"
 #include "macb.h"
 
 static unsigned int txdelay = 35;
