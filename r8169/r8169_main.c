@@ -29,8 +29,12 @@
 #include <linux/prefetch.h>
 #include <linux/ipv6.h>
 #include <linux/unaligned.h>
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
+#include <linux/filter.h>
 #include <net/ip6_checksum.h>
 #include <net/netdev_queues.h>
+#include <net/xdp.h>
 
 #include "r8169.h"
 #include "compat.h"
@@ -631,8 +635,12 @@ struct RxDesc {
 };
 
 struct ring_info {
-	struct sk_buff	*skb;
+	union {
+		struct sk_buff	*skb;
+		struct xdp_frame *xdpf;
+	};
 	u32		len;
+#define R8169_TX_IS_XDP BIT(31)
 };
 
 struct rtl8169_counters {
@@ -718,6 +726,8 @@ struct rtl8169_private {
 	struct page *Rx_databuff[NUM_RX_DESC];	/* Rx data buffers */
 	struct page_pool *page_pool;
 	struct ring_info tx_skb[NUM_TX_DESC];	/* Tx data buffers */
+	struct bpf_prog __rcu *xdp_prog;
+	struct xdp_rxq_info xdp_rxq;
 	u16 cp_cmd;
 	u16 tx_lpi_timer;
 	u32 irq_mask;
@@ -4069,11 +4079,19 @@ static void rtl8169_tx_clear_range(struct rtl8169_private *tp, u32 start,
 		unsigned int len = tx_skb->len;
 
 		if (len) {
-			struct sk_buff *skb = tx_skb->skb;
+			if (len & R8169_TX_IS_XDP) {
+				struct xdp_frame *xdpf = tx_skb->xdpf;
 
-			rtl8169_unmap_tx_skb(tp, entry);
-			if (skb)
-				dev_consume_skb_any(skb);
+				rtl8169_unmap_tx_skb(tp, entry);
+				if (xdpf)
+					xdp_return_frame(xdpf);
+			} else {
+				struct sk_buff *skb = tx_skb->skb;
+
+				rtl8169_unmap_tx_skb(tp, entry);
+				if (skb)
+					dev_consume_skb_any(skb);
+			}
 		}
 	}
 }
@@ -4534,19 +4552,28 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 
 	while (READ_ONCE(tp->cur_tx) != dirty_tx) {
 		unsigned int entry = dirty_tx % NUM_TX_DESC;
+		struct ring_info *tx_info = tp->tx_skb + entry;
 		u32 status;
 
 		status = le32_to_cpu(READ_ONCE(tp->TxDescArray[entry].opts1));
 		if (status & DescOwn)
 			break;
 
-		skb = tp->tx_skb[entry].skb;
-		rtl8169_unmap_tx_skb(tp, entry);
+		if (tx_info->len & R8169_TX_IS_XDP) {
+			struct xdp_frame *xdpf = tx_info->xdpf;
 
-		if (skb) {
-			pkts_compl++;
-			bytes_compl += skb->len;
-			napi_consume_skb(skb, budget);
+			rtl8169_unmap_tx_skb(tp, entry);
+			if (xdpf)
+				xdp_return_frame_rx_napi(xdpf);
+		} else {
+			skb = tx_info->skb;
+			rtl8169_unmap_tx_skb(tp, entry);
+
+			if (skb) {
+				pkts_compl++;
+				bytes_compl += skb->len;
+				napi_consume_skb(skb, budget);
+			}
 		}
 		dirty_tx++;
 	}
@@ -4569,6 +4596,102 @@ static void rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
 		if (READ_ONCE(tp->cur_tx) != dirty_tx && skb)
 			rtl8169_doorbell(tp);
 	}
+}
+
+/* ── XDP transmit helpers ───────────────────────────────────────────── */
+
+static int rtl8169_xdp_queue_one(struct rtl8169_private *tp,
+				 struct xdp_frame *xdpf, bool dma_map)
+{
+	struct TxDesc *txd;
+	struct ring_info *tx_info;
+	unsigned int entry;
+	dma_addr_t dma;
+	u32 opts1;
+
+	if (unlikely(rtl_tx_slots_avail(tp) < 1))
+		return -EBUSY;
+
+	entry = tp->cur_tx % NUM_TX_DESC;
+	txd = tp->TxDescArray + entry;
+	tx_info = tp->tx_skb + entry;
+
+	if (dma_map) {
+		dma = dma_map_single(tp_to_dev(tp), xdpf->data, xdpf->len,
+				     DMA_TO_DEVICE);
+		if (dma_mapping_error(tp_to_dev(tp), dma))
+			return -ENOMEM;
+		tx_info->len = xdpf->len | R8169_TX_IS_XDP;
+	} else {
+		struct page *page = virt_to_head_page(xdpf->data);
+		unsigned long page_offset;
+
+		page_offset = (unsigned long)xdpf->data -
+			      (unsigned long)page_address(page);
+		dma = page_pool_get_dma_addr(page) + page_offset;
+		tx_info->len = xdpf->len | R8169_TX_IS_XDP;
+	}
+
+	tx_info->xdpf = xdpf;
+
+	txd->addr = cpu_to_le64(dma);
+	txd->opts2 = 0;
+
+	opts1 = DescOwn | FirstFrag | LastFrag | xdpf->len;
+	if (entry == NUM_TX_DESC - 1)
+		opts1 |= RingEnd;
+
+	/* Ensure data is written before giving descriptor to HW */
+	dma_wmb();
+	txd->opts1 = cpu_to_le32(opts1);
+
+	tp->cur_tx++;
+
+	return 0;
+}
+
+static int rtl8169_xdp_xmit_back(struct rtl8169_private *tp,
+				  struct xdp_buff *xdp)
+{
+	struct netdev_queue *nq = netdev_get_tx_queue(tp->dev, 0);
+	struct xdp_frame *xdpf;
+	int err;
+
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (unlikely(!xdpf))
+		return -ENOMEM;
+
+	__netif_tx_lock_bh(nq);
+	err = rtl8169_xdp_queue_one(tp, xdpf, false);
+	if (!err)
+		rtl8169_doorbell(tp);
+	__netif_tx_unlock_bh(nq);
+
+	return err;
+}
+
+static int rtl8169_xdp_xmit(struct net_device *dev, int n,
+			     struct xdp_frame **frames, u32 flags)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+	struct netdev_queue *nq = netdev_get_tx_queue(dev, 0);
+	int i, nxmit = 0;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	__netif_tx_lock_bh(nq);
+	for (i = 0; i < n; i++) {
+		if (rtl8169_xdp_queue_one(tp, frames[i], true))
+			break;
+		nxmit++;
+	}
+
+	if (nxmit)
+		rtl8169_doorbell(tp);
+	__netif_tx_unlock_bh(nq);
+
+	return nxmit;
 }
 
 static inline int rtl8169_fragmented_frame(u32 status)
@@ -4609,11 +4732,17 @@ static void rtl_rx_refill(struct net_device *dev, struct rtl8169_private *tp)
 
 static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget)
 {
+	struct bpf_prog *prog;
+	bool xdp_redirect = false;
 	int count;
+
+	rcu_read_lock();
+	prog = rcu_dereference(tp->xdp_prog);
 
 	for (count = 0; count < budget; count++, tp->cur_rx++) {
 		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
 		struct RxDesc *desc = tp->RxDescArray + entry;
+		unsigned int headroom = R8169_RX_HEADROOM;
 		struct page *page;
 		struct sk_buff *skb;
 		u32 status;
@@ -4664,13 +4793,57 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 					   R8169_RX_HEADROOM, pkt_size);
 		prefetch(page_address(page) + R8169_RX_HEADROOM);
 
+		if (prog) {
+			struct xdp_buff xdp;
+			u32 act;
+
+			xdp_init_buff(&xdp, R8169_RX_PAGE_SIZE, &tp->xdp_rxq);
+			xdp_prepare_buff(&xdp, page_address(page),
+					 R8169_RX_HEADROOM, pkt_size, false);
+
+			act = bpf_prog_run_xdp(prog, &xdp);
+			switch (act) {
+			case XDP_PASS:
+				pkt_size = xdp.data_end - xdp.data;
+				headroom = xdp.data - xdp.data_hard_start;
+				break;
+			case XDP_DROP:
+				page_pool_put_full_page(tp->page_pool,
+							page, true);
+				dev->stats.rx_dropped++;
+				goto next_desc;
+			case XDP_TX:
+				if (rtl8169_xdp_xmit_back(tp, &xdp))
+					page_pool_put_full_page(tp->page_pool,
+								page, true);
+				goto next_desc;
+			case XDP_REDIRECT:
+				if (xdp_do_redirect(dev, &xdp, prog)) {
+					page_pool_put_full_page(tp->page_pool,
+								page, true);
+					dev->stats.rx_dropped++;
+				} else {
+					xdp_redirect = true;
+				}
+				goto next_desc;
+			default:
+				bpf_warn_invalid_xdp_action(dev, prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+				trace_xdp_exception(dev, prog, act);
+				page_pool_put_full_page(tp->page_pool,
+							page, true);
+				goto next_desc;
+			}
+		}
+
 		skb = napi_build_skb(page_address(page), R8169_RX_PAGE_SIZE);
 		if (unlikely(!skb)) {
 			dev->stats.rx_dropped++;
 			goto recycle_page;
 		}
 
-		skb_reserve(skb, R8169_RX_HEADROOM);
+		skb_reserve(skb, headroom);
 		skb_put(skb, pkt_size);
 		skb_mark_for_recycle(skb);
 
@@ -4687,9 +4860,17 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 		dev_sw_netstats_rx_add(dev, pkt_size);
 		continue;
 
+next_desc:
+		continue;
+
 recycle_page:
 		page_pool_put_full_page(tp->page_pool, page, true);
 	}
+
+	if (xdp_redirect)
+		xdp_do_flush();
+
+	rcu_read_unlock();
 
 	rtl_rx_refill(dev, tp);
 
@@ -4855,6 +5036,8 @@ static int rtl8169_close(struct net_device *dev)
 	rtl8169_down(tp);
 	rtl8169_rx_clear(tp);
 
+	xdp_rxq_info_unreg(&tp->xdp_rxq);
+
 	free_irq(tp->irq, tp);
 
 	phy_disconnect(tp->phydev);
@@ -4884,6 +5067,23 @@ static void rtl8169_netpoll(struct net_device *dev)
 	rtl8169_interrupt(tp->irq, tp);
 }
 #endif
+
+static int rtl8169_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+{
+	struct rtl8169_private *tp = netdev_priv(dev);
+	struct bpf_prog *prog;
+
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		prog = tp->xdp_prog;
+		rcu_assign_pointer(tp->xdp_prog, xdp->prog);
+		if (prog)
+			bpf_prog_put(prog);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
 
 static int rtl_open(struct net_device *dev)
 {
@@ -4931,6 +5131,16 @@ static int rtl_open(struct net_device *dev)
 		}
 	}
 
+	retval = xdp_rxq_info_reg(&tp->xdp_rxq, dev, 0, tp->napi.napi_id);
+	if (retval < 0)
+		goto err_free_pool;
+
+	retval = xdp_rxq_info_reg_mem_model(&tp->xdp_rxq,
+					     MEM_TYPE_PAGE_POOL,
+					     tp->page_pool);
+	if (retval < 0)
+		goto err_unreg_rxq;
+
 	retval = rtl8169_init_ring(tp);
 	if (retval < 0)
 		goto err_free_rx_1;
@@ -4959,6 +5169,9 @@ err_free_irq:
 err_release_fw_2:
 	rtl_release_firmware(tp);
 	rtl8169_rx_clear(tp);
+err_unreg_rxq:
+	xdp_rxq_info_unreg(&tp->xdp_rxq);
+err_free_pool:
 err_free_rx_1:
 	if (tp->page_pool) {
 		page_pool_destroy(tp->page_pool);
@@ -5151,7 +5364,8 @@ static const struct net_device_ops rtl_netdev_ops = {
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= rtl8169_netpoll,
 #endif
-
+	.ndo_bpf		= rtl8169_xdp,
+	.ndo_xdp_xmit		= rtl8169_xdp_xmit,
 };
 
 static void rtl_set_irq_mask(struct rtl8169_private *tp)
