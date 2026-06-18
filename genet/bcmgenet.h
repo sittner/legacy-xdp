@@ -6,6 +6,8 @@
 #ifndef __BCMGENET_H__
 #define __BCMGENET_H__
 
+#include "compat.h"
+
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
 #include <linux/spinlock.h>
@@ -16,7 +18,7 @@
 #include <linux/dim.h>
 #include <linux/ethtool.h>
 
-#include "../unimac.h"
+#include "unimac.h"
 
 /* Maximum number of hardware queues, downsized if needed */
 #define GENET_MAX_MQ_CNT	4

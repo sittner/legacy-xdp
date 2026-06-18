@@ -1,3 +1,9 @@
-# SPDX-License-Identifier: GPL-2.0-only
-obj-$(CONFIG_BCMGENET) += genet.o
-genet-objs := bcmgenet.o bcmmii.o bcmgenet_wol.o
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+.PHONY: modules clean
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
