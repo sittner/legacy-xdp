@@ -17,6 +17,9 @@
 #include <linux/phy.h>
 #include <linux/dim.h>
 #include <linux/ethtool.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <net/xdp.h>
 
 #include "unimac.h"
 
@@ -471,12 +474,14 @@ struct bcmgenet_rx_stats64 {
 
 struct enet_cb {
 	union {
-		struct sk_buff	*skb;	/* TX path */
-		struct page	*rx_page; /* RX path (page_pool) */
+		struct sk_buff		*skb;		/* TX: normal skb */
+		struct xdp_frame	*xdpf;		/* TX: XDP frame */
+		struct page		*rx_page;	/* RX: page_pool page */
 	};
 	void __iomem *bd_addr;
 	DEFINE_DMA_UNMAP_ADDR(dma_addr);
 	DEFINE_DMA_UNMAP_LEN(dma_len);
+	bool is_xdp;
 };
 
 /* power management mode */
@@ -581,6 +586,7 @@ struct bcmgenet_rx_ring {
 	u32		rx_max_coalesced_frames;
 	u32		rx_coalesce_usecs;
 	struct page_pool *page_pool;
+	struct xdp_rxq_info xdp_rxq;
 	struct bcmgenet_priv *priv;
 };
 
@@ -620,6 +626,9 @@ struct bcmgenet_priv {
 	struct list_head rxnfc_list;
 
 	struct bcmgenet_rx_ring rx_rings[GENET_MAX_MQ_CNT + 1];
+
+	/* XDP */
+	struct bpf_prog __rcu *xdp_prog;
 
 	/* other misc variables */
 	const struct bcmgenet_hw_params *hw_params;

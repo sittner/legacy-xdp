@@ -38,6 +38,7 @@
 #include <linux/platform_data/bcmgenet.h>
 
 #include <linux/unaligned.h>
+#include <linux/bpf_trace.h>
 
 #include "bcmgenet.h"
 
@@ -66,6 +67,8 @@
 
 /* Forward declarations */
 static void bcmgenet_set_rx_mode(struct net_device *dev);
+static int bcmgenet_xdp_xmit_back(struct bcmgenet_priv *priv,
+				   struct xdp_buff *xdp);
 
 static inline void bcmgenet_writel(u32 value, void __iomem *offset)
 {
@@ -1862,6 +1865,17 @@ static struct sk_buff *bcmgenet_free_tx_cb(struct device *dev,
 {
 	struct sk_buff *skb;
 
+	if (cb->is_xdp) {
+		struct xdp_frame *xdpf = cb->xdpf;
+
+		cb->xdpf = NULL;
+		cb->is_xdp = false;
+		dma_unmap_addr_set(cb, dma_addr, 0);
+		if (xdpf)
+			xdp_return_frame_rx_napi(xdpf);
+		return NULL;
+	}
+
 	skb = cb->skb;
 
 	if (skb) {
@@ -1966,6 +1980,10 @@ static unsigned int bcmgenet_tx_reclaim(struct net_device *dev,
 		ring->free_bds += drop;
 		while (drop--) {
 			cb_ptr = bcmgenet_put_txcb(priv, ring);
+			if (cb_ptr->is_xdp) {
+				bcmgenet_free_tx_cb(kdev, cb_ptr);
+				continue;
+			}
 			skb = cb_ptr->skb;
 			bcmgenet_free_tx_cb(kdev, cb_ptr);
 			if (skb && cb_ptr == GENET_CB(skb)->first_cb) {
@@ -2276,6 +2294,9 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 	unsigned int bytes_processed = 0;
 	unsigned int p_index, mask;
 	unsigned int discards;
+	bool xdp_redirect = false;
+	struct bpf_prog *xdp_prog;
+	unsigned int headroom;
 
 	/* Clear status before servicing to reduce spurious interrupts */
 	mask = 1 << (UMAC_IRQ1_RX_INTR_SHIFT + ring->index);
@@ -2303,6 +2324,9 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 
 	netif_dbg(priv, rx_status, dev,
 		  "RDMA: rxpkttoprocess=%d\n", rxpkttoprocess);
+
+	rcu_read_lock();
+	xdp_prog = rcu_dereference(priv->xdp_prog);
 
 	while ((rxpktprocessed < rxpkttoprocess) &&
 	       (rxpktprocessed < budget)) {
@@ -2380,8 +2404,60 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 			goto next;
 		} /* error packet */
 
+		/* Strip RSB (64 bytes) + 2 bytes HW alignment = 66 bytes */
+		len -= 66;
+		if (priv->crc_fwd_en)
+			len -= ETH_FCS_LEN;
+
+		/* XDP program runs on the actual packet data (after RSB) */
+		headroom = GENET_RX_HEADROOM + 66;
+		if (xdp_prog) {
+			struct xdp_buff xdp;
+			u32 act;
+
+			xdp_init_buff(&xdp, PAGE_SIZE, &ring->xdp_rxq);
+			xdp_prepare_buff(&xdp, page_address(page),
+					 headroom, len, false);
+
+			act = bpf_prog_run_xdp(xdp_prog, &xdp);
+			switch (act) {
+			case XDP_PASS:
+				len = xdp.data_end - xdp.data;
+				headroom = xdp.data - (void *)page_address(page);
+				break;
+			case XDP_DROP:
+				page_pool_put_full_page(ring->page_pool,
+							page, true);
+				dev->stats.rx_dropped++;
+				goto next;
+			case XDP_TX:
+				if (bcmgenet_xdp_xmit_back(priv, &xdp))
+					page_pool_put_full_page(ring->page_pool,
+								page, true);
+				goto next;
+			case XDP_REDIRECT:
+				if (xdp_do_redirect(dev, &xdp, xdp_prog)) {
+					page_pool_put_full_page(ring->page_pool,
+								page, true);
+					dev->stats.rx_dropped++;
+				} else {
+					xdp_redirect = true;
+				}
+				goto next;
+			default:
+				bpf_warn_invalid_xdp_action(dev, xdp_prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+				trace_xdp_exception(dev, xdp_prog, act);
+				page_pool_put_full_page(ring->page_pool,
+							page, true);
+				goto next;
+			}
+		}
+
 		/* Build an SKB from the page */
-		skb = napi_build_skb(data, PAGE_SIZE - GENET_RX_HEADROOM);
+		skb = napi_build_skb(page_address(page) + headroom,
+				     PAGE_SIZE - headroom);
 		if (unlikely(!skb)) {
 			BCMGENET_STATS64_INC(stats, dropped);
 			page_pool_put_full_page(ring->page_pool, page, true);
@@ -2389,15 +2465,6 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 		}
 
 		skb_put(skb, len);
-
-		/* remove RSB and hardware 2bytes added for IP alignment */
-		skb_pull(skb, 66);
-		len -= 66;
-
-		if (priv->crc_fwd_en) {
-			skb_trim(skb, len - ETH_FCS_LEN);
-			len -= ETH_FCS_LEN;
-		}
 
 		if (dev->features & NETIF_F_RXCSUM) {
 			rx_csum = (__force __be16)(status->rx_csum & 0xffff);
@@ -2436,6 +2503,11 @@ next:
 		ring->c_index = (ring->c_index + 1) & DMA_C_INDEX_MASK;
 		bcmgenet_rdma_ring_writel(priv, ring->index, ring->c_index, RDMA_CONS_INDEX);
 	}
+
+	if (xdp_redirect)
+		xdp_do_flush();
+
+	rcu_read_unlock();
 
 	ring->dim.bytes = bytes_processed;
 	ring->dim.packets = rxpktprocessed;
@@ -2517,6 +2589,7 @@ static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
 
 	for (i = 0; i <= priv->hw_params->rx_queues; i++) {
 		if (priv->rx_rings[i].page_pool) {
+			xdp_rxq_info_unreg(&priv->rx_rings[i].xdp_rxq);
 			page_pool_destroy(priv->rx_rings[i].page_pool);
 			priv->rx_rings[i].page_pool = NULL;
 		}
@@ -2774,8 +2847,26 @@ static int bcmgenet_init_rx_ring(struct bcmgenet_priv *priv,
 		return PTR_ERR(pp);
 	ring->page_pool = pp;
 
+	ret = xdp_rxq_info_reg(&ring->xdp_rxq, priv->dev, index,
+			       ring->napi.napi_id);
+	if (ret) {
+		page_pool_destroy(pp);
+		ring->page_pool = NULL;
+		return ret;
+	}
+
+	ret = xdp_rxq_info_reg_mem_model(&ring->xdp_rxq,
+					  MEM_TYPE_PAGE_POOL, pp);
+	if (ret) {
+		xdp_rxq_info_unreg(&ring->xdp_rxq);
+		page_pool_destroy(pp);
+		ring->page_pool = NULL;
+		return ret;
+	}
+
 	ret = bcmgenet_alloc_rx_buffers(priv, ring);
 	if (ret) {
+		xdp_rxq_info_unreg(&ring->xdp_rxq);
 		page_pool_destroy(pp);
 		ring->page_pool = NULL;
 		return ret;
@@ -3676,6 +3767,137 @@ static int bcmgenet_change_carrier(struct net_device *dev, bool new_carrier)
 	return 0;
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * XDP support
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+static int bcmgenet_xdp_xmit_back(struct bcmgenet_priv *priv,
+				   struct xdp_buff *xdp)
+{
+	struct bcmgenet_tx_ring *ring = &priv->tx_rings[0];
+	struct netdev_queue *txq = netdev_get_tx_queue(priv->dev, 0);
+	struct xdp_frame *xdpf;
+	struct enet_cb *tx_cb;
+	struct page *page;
+	dma_addr_t dma;
+	u32 len_stat;
+
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (unlikely(!xdpf))
+		return -ENOMEM;
+
+	__netif_tx_lock_bh(txq);
+
+	if (ring->free_bds < 1) {
+		__netif_tx_unlock_bh(txq);
+		xdp_return_frame_rx_napi(xdpf);
+		return -ENOSPC;
+	}
+
+	tx_cb = bcmgenet_get_txcb(priv, ring);
+
+	/* XDP_TX buffer is page_pool-backed, use page DMA addr directly */
+	page = virt_to_head_page(xdpf->data);
+	dma = page_pool_get_dma_addr(page) +
+	      (xdpf->data - page_address(page));
+	dma_sync_single_for_device(&priv->pdev->dev, dma, xdpf->len,
+				   DMA_TO_DEVICE);
+
+	tx_cb->xdpf = xdpf;
+	tx_cb->is_xdp = true;
+	dma_unmap_addr_set(tx_cb, dma_addr, dma);
+	dma_unmap_len_set(tx_cb, dma_len, xdpf->len);
+
+	len_stat = (xdpf->len << DMA_BUFLENGTH_SHIFT) |
+		   (priv->hw_params->qtag_mask << DMA_TX_QTAG_SHIFT) |
+		   DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+
+	dmadesc_set(priv, tx_cb->bd_addr, dma, len_stat);
+
+	ring->free_bds--;
+	ring->prod_index++;
+	ring->prod_index &= DMA_P_INDEX_MASK;
+
+	bcmgenet_tdma_ring_writel(priv, ring->index,
+				  ring->prod_index, TDMA_PROD_INDEX);
+
+	__netif_tx_unlock_bh(txq);
+	return 0;
+}
+
+static int bcmgenet_xdp_xmit(struct net_device *dev, int n,
+			     struct xdp_frame **frames, u32 flags)
+{
+	struct bcmgenet_priv *priv = netdev_priv(dev);
+	struct bcmgenet_tx_ring *ring = &priv->tx_rings[0];
+	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
+	struct enet_cb *tx_cb;
+	int i, nxmit = 0;
+	dma_addr_t dma;
+	u32 len_stat;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	__netif_tx_lock_bh(txq);
+
+	for (i = 0; i < n; i++) {
+		struct xdp_frame *xdpf = frames[i];
+
+		if (ring->free_bds < 1)
+			break;
+
+		tx_cb = bcmgenet_get_txcb(priv, ring);
+
+		dma = dma_map_single(&priv->pdev->dev, xdpf->data, xdpf->len,
+				     DMA_TO_DEVICE);
+		if (dma_mapping_error(&priv->pdev->dev, dma)) {
+			bcmgenet_put_txcb(priv, ring);
+			break;
+		}
+
+		tx_cb->xdpf = xdpf;
+		tx_cb->is_xdp = true;
+		dma_unmap_addr_set(tx_cb, dma_addr, dma);
+		dma_unmap_len_set(tx_cb, dma_len, xdpf->len);
+
+		len_stat = (xdpf->len << DMA_BUFLENGTH_SHIFT) |
+			   (priv->hw_params->qtag_mask << DMA_TX_QTAG_SHIFT) |
+			   DMA_TX_APPEND_CRC | DMA_SOP | DMA_EOP;
+
+		dmadesc_set(priv, tx_cb->bd_addr, dma, len_stat);
+
+		ring->free_bds--;
+		ring->prod_index++;
+		ring->prod_index &= DMA_P_INDEX_MASK;
+		nxmit++;
+	}
+
+	if (nxmit)
+		bcmgenet_tdma_ring_writel(priv, ring->index,
+					  ring->prod_index, TDMA_PROD_INDEX);
+
+	__netif_tx_unlock_bh(txq);
+	return nxmit;
+}
+
+static int bcmgenet_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+{
+	struct bcmgenet_priv *priv = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		old_prog = priv->xdp_prog;
+		rcu_assign_pointer(priv->xdp_prog, xdp->prog);
+		if (old_prog)
+			bpf_prog_put(old_prog);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct net_device_ops bcmgenet_netdev_ops = {
 	.ndo_open		= bcmgenet_open,
 	.ndo_stop		= bcmgenet_close,
@@ -3687,6 +3909,8 @@ static const struct net_device_ops bcmgenet_netdev_ops = {
 	.ndo_set_features	= bcmgenet_set_features,
 	.ndo_get_stats64	= bcmgenet_get_stats64,
 	.ndo_change_carrier	= bcmgenet_change_carrier,
+	.ndo_bpf		= bcmgenet_xdp,
+	.ndo_xdp_xmit		= bcmgenet_xdp_xmit,
 };
 
 /* GENET hardware parameters/characteristics */
