@@ -33,6 +33,7 @@
 #include <net/netdev_queues.h>
 
 #include "r8169.h"
+#include "compat.h"
 #include "r8169_firmware.h"
 
 #define FIRMWARE_8168D_1	"rtl_nic/rtl8168d-1.fw"
@@ -67,6 +68,9 @@
 
 #define R8169_REGS_SIZE		256
 #define R8169_RX_BUF_SIZE	(SZ_16K - 1)
+#define R8169_RX_PAGE_ORDER	get_order(R8169_RX_BUF_SIZE)
+#define R8169_RX_PAGE_SIZE	(PAGE_SIZE << R8169_RX_PAGE_ORDER)
+#define R8169_RX_HEADROOM	XDP_PACKET_HEADROOM
 #define NUM_TX_DESC	256	/* Number of Tx descriptor registers */
 #define NUM_RX_DESC	256	/* Number of Rx descriptor registers */
 #define R8169_TX_RING_BYTES	(NUM_TX_DESC * sizeof(struct TxDesc))
@@ -704,6 +708,7 @@ struct rtl8169_private {
 	enum mac_version mac_version;
 	enum rtl_dash_type dash_type;
 	u32 cur_rx; /* Index into the Rx descriptor buffer of next Rx pkt. */
+	u32 dirty_rx;
 	u32 cur_tx; /* Index into the Tx descriptor buffer of next Rx pkt. */
 	u32 dirty_tx;
 	struct TxDesc *TxDescArray;	/* 256-aligned Tx descriptor ring */
@@ -711,6 +716,7 @@ struct rtl8169_private {
 	dma_addr_t TxPhyAddr;
 	dma_addr_t RxPhyAddr;
 	struct page *Rx_databuff[NUM_RX_DESC];	/* Rx data buffers */
+	struct page_pool *page_pool;
 	struct ring_info tx_skb[NUM_TX_DESC];	/* Tx data buffers */
 	u16 cp_cmd;
 	u16 tx_lpi_timer;
@@ -2515,7 +2521,7 @@ static void rtl_init_rxcfg(struct rtl8169_private *tp)
 
 static void rtl8169_init_ring_indexes(struct rtl8169_private *tp)
 {
-	tp->dirty_tx = tp->cur_tx = tp->cur_rx = 0;
+	tp->dirty_tx = tp->cur_tx = tp->dirty_rx = tp->cur_rx = 0;
 }
 
 static void rtl_jumbo_config(struct rtl8169_private *tp)
@@ -3983,22 +3989,14 @@ static void rtl8169_mark_to_asic(struct RxDesc *desc)
 static struct page *rtl8169_alloc_rx_data(struct rtl8169_private *tp,
 					  struct RxDesc *desc)
 {
-	struct device *d = tp_to_dev(tp);
-	int node = dev_to_node(d);
-	dma_addr_t mapping;
 	struct page *data;
+	dma_addr_t mapping;
 
-	data = alloc_pages_node(node, GFP_KERNEL, get_order(R8169_RX_BUF_SIZE));
+	data = page_pool_dev_alloc_pages(tp->page_pool);
 	if (!data)
 		return NULL;
 
-	mapping = dma_map_page(d, data, 0, R8169_RX_BUF_SIZE, DMA_FROM_DEVICE);
-	if (unlikely(dma_mapping_error(d, mapping))) {
-		netdev_err(tp->dev, "Failed to map RX DMA!\n");
-		__free_pages(data, get_order(R8169_RX_BUF_SIZE));
-		return NULL;
-	}
-
+	mapping = page_pool_get_dma_addr(data) + R8169_RX_HEADROOM;
 	desc->addr = cpu_to_le64(mapping);
 	rtl8169_mark_to_asic(desc);
 
@@ -4010,10 +4008,8 @@ static void rtl8169_rx_clear(struct rtl8169_private *tp)
 	int i;
 
 	for (i = 0; i < NUM_RX_DESC && tp->Rx_databuff[i]; i++) {
-		dma_unmap_page(tp_to_dev(tp),
-			       le64_to_cpu(tp->RxDescArray[i].addr),
-			       R8169_RX_BUF_SIZE, DMA_FROM_DEVICE);
-		__free_pages(tp->Rx_databuff[i], get_order(R8169_RX_BUF_SIZE));
+		page_pool_put_full_page(tp->page_pool, tp->Rx_databuff[i],
+					false);
 		tp->Rx_databuff[i] = NULL;
 		tp->RxDescArray[i].addr = 0;
 		tp->RxDescArray[i].opts1 = 0;
@@ -4590,17 +4586,36 @@ static inline void rtl8169_rx_csum(struct sk_buff *skb, u32 opts1)
 		skb_checksum_none_assert(skb);
 }
 
+static void rtl_rx_refill(struct net_device *dev, struct rtl8169_private *tp)
+{
+	unsigned int i;
+
+	for (i = tp->dirty_rx; i != tp->cur_rx; i++) {
+		unsigned int entry = i % NUM_RX_DESC;
+		struct RxDesc *desc = tp->RxDescArray + entry;
+		struct page *page;
+
+		if (tp->Rx_databuff[entry])
+			continue;
+
+		page = rtl8169_alloc_rx_data(tp, desc);
+		if (!page)
+			break;
+
+		tp->Rx_databuff[entry] = page;
+	}
+	tp->dirty_rx = i;
+}
+
 static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget)
 {
-	struct device *d = tp_to_dev(tp);
-	int count;
+	int count, cleaned_count = 0;
 
 	for (count = 0; count < budget; count++, tp->cur_rx++) {
 		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
 		struct RxDesc *desc = tp->RxDescArray + entry;
+		struct page *page;
 		struct sk_buff *skb;
-		const void *rx_buf;
-		dma_addr_t addr;
 		u32 status;
 
 		status = le32_to_cpu(READ_ONCE(desc->opts1));
@@ -4613,6 +4628,10 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 		 */
 		dma_rmb();
 
+		page = tp->Rx_databuff[entry];
+		tp->Rx_databuff[entry] = NULL;
+		cleaned_count++;
+
 		if (unlikely(status & RxRES)) {
 			if (net_ratelimit())
 				netdev_warn(dev, "Rx ERROR. status = %08x\n",
@@ -4624,9 +4643,9 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 				dev->stats.rx_crc_errors++;
 
 			if (!(dev->features & NETIF_F_RXALL))
-				goto release_descriptor;
+				goto recycle_page;
 			else if (status & RxRWT || !(status & (RxRUNT | RxCRC)))
-				goto release_descriptor;
+				goto recycle_page;
 		}
 
 		pkt_size = status & GENMASK(13, 0);
@@ -4639,24 +4658,22 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 		if (unlikely(rtl8169_fragmented_frame(status))) {
 			dev->stats.rx_dropped++;
 			dev->stats.rx_length_errors++;
-			goto release_descriptor;
+			goto recycle_page;
 		}
 
-		skb = napi_alloc_skb(&tp->napi, pkt_size);
+		page_pool_dma_sync_for_cpu(tp->page_pool, page,
+					   R8169_RX_HEADROOM, pkt_size);
+		prefetch(page_address(page) + R8169_RX_HEADROOM);
+
+		skb = napi_build_skb(page_address(page), R8169_RX_PAGE_SIZE);
 		if (unlikely(!skb)) {
 			dev->stats.rx_dropped++;
-			goto release_descriptor;
+			goto recycle_page;
 		}
 
-		addr = le64_to_cpu(desc->addr);
-		rx_buf = page_address(tp->Rx_databuff[entry]);
-
-		dma_sync_single_for_cpu(d, addr, pkt_size, DMA_FROM_DEVICE);
-		prefetch(rx_buf);
-		skb_copy_to_linear_data(skb, rx_buf, pkt_size);
-		skb->tail += pkt_size;
-		skb->len = pkt_size;
-		dma_sync_single_for_device(d, addr, pkt_size, DMA_FROM_DEVICE);
+		skb_reserve(skb, R8169_RX_HEADROOM);
+		skb_put(skb, pkt_size);
+		skb_mark_for_recycle(skb);
 
 		rtl8169_rx_csum(skb, status);
 		skb->protocol = eth_type_trans(skb, dev);
@@ -4669,9 +4686,14 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 		napi_gro_receive(&tp->napi, skb);
 
 		dev_sw_netstats_rx_add(dev, pkt_size);
-release_descriptor:
-		rtl8169_mark_to_asic(desc);
+		continue;
+
+recycle_page:
+		page_pool_put_full_page(tp->page_pool, page, true);
 	}
+
+	tp->dirty_rx += cleaned_count;
+	rtl_rx_refill(dev, tp);
 
 	return count;
 }
@@ -4846,6 +4868,11 @@ static int rtl8169_close(struct net_device *dev)
 	tp->TxDescArray = NULL;
 	tp->RxDescArray = NULL;
 
+	if (tp->page_pool) {
+		page_pool_destroy(tp->page_pool);
+		tp->page_pool = NULL;
+	}
+
 	pm_runtime_put_sync(&pdev->dev);
 
 	return 0;
@@ -4883,6 +4910,29 @@ static int rtl_open(struct net_device *dev)
 	if (!tp->RxDescArray)
 		goto err_free_tx_0;
 
+	{
+		struct page_pool_params pp_params = {
+			.flags		= PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+			.order		= R8169_RX_PAGE_ORDER,
+			.pool_size	= NUM_RX_DESC,
+			.nid		= dev_to_node(&pdev->dev),
+			.dev		= &pdev->dev,
+			OOT_PAGE_POOL_NAPI_INIT(&tp->napi)
+			.dma_dir	= DMA_FROM_DEVICE,
+			.max_len	= R8169_RX_PAGE_SIZE,
+			.offset		= R8169_RX_HEADROOM,
+		};
+
+		OOT_PAGE_POOL_SET_NETDEV(&pp_params, dev);
+
+		tp->page_pool = page_pool_create(&pp_params);
+		if (IS_ERR(tp->page_pool)) {
+			retval = PTR_ERR(tp->page_pool);
+			tp->page_pool = NULL;
+			goto err_free_rx_1;
+		}
+	}
+
 	retval = rtl8169_init_ring(tp);
 	if (retval < 0)
 		goto err_free_rx_1;
@@ -4912,6 +4962,10 @@ err_release_fw_2:
 	rtl_release_firmware(tp);
 	rtl8169_rx_clear(tp);
 err_free_rx_1:
+	if (tp->page_pool) {
+		page_pool_destroy(tp->page_pool);
+		tp->page_pool = NULL;
+	}
 	dma_free_coherent(&pdev->dev, R8169_RX_RING_BYTES, tp->RxDescArray,
 			  tp->RxPhyAddr);
 	tp->RxDescArray = NULL;
