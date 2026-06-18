@@ -640,7 +640,9 @@ struct ring_info {
 		struct xdp_frame *xdpf;
 	};
 	u32		len;
-#define R8169_TX_IS_XDP BIT(31)
+#define R8169_TX_IS_XDP  BIT(31)
+#define R8169_TX_XDP_PP  BIT(30)  /* page_pool-backed, skip DMA unmap */
+#define R8169_TX_LEN_MASK GENMASK(15, 0)
 };
 
 struct rtl8169_counters {
@@ -4062,8 +4064,10 @@ static void rtl8169_unmap_tx_skb(struct rtl8169_private *tp, unsigned int entry)
 	struct ring_info *tx_skb = tp->tx_skb + entry;
 	struct TxDesc *desc = tp->TxDescArray + entry;
 
-	dma_unmap_single(tp_to_dev(tp), le64_to_cpu(desc->addr), tx_skb->len,
-			 DMA_TO_DEVICE);
+	if (!(tx_skb->len & R8169_TX_XDP_PP))
+		dma_unmap_single(tp_to_dev(tp), le64_to_cpu(desc->addr),
+				 tx_skb->len & R8169_TX_LEN_MASK,
+				 DMA_TO_DEVICE);
 	memset(desc, 0, sizeof(*desc));
 	memset(tx_skb, 0, sizeof(*tx_skb));
 }
@@ -4629,7 +4633,9 @@ static int rtl8169_xdp_queue_one(struct rtl8169_private *tp,
 		page_offset = (unsigned long)xdpf->data -
 			      (unsigned long)page_address(page);
 		dma = page_pool_get_dma_addr(page) + page_offset;
-		tx_info->len = xdpf->len | R8169_TX_IS_XDP;
+		dma_sync_single_for_device(tp_to_dev(tp), dma, xdpf->len,
+					   DMA_TO_DEVICE);
+		tx_info->len = xdpf->len | R8169_TX_IS_XDP | R8169_TX_XDP_PP;
 	}
 
 	tx_info->xdpf = xdpf;
