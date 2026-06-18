@@ -67,10 +67,10 @@
 #define InterFrameGap	0x03	/* 3 means InterFrameGap = the shortest one */
 
 #define R8169_REGS_SIZE		256
-#define R8169_RX_BUF_SIZE	(SZ_16K - 1)
-#define R8169_RX_PAGE_ORDER	get_order(R8169_RX_BUF_SIZE)
+#define R8169_RX_PAGE_ORDER	get_order(SZ_16K)
 #define R8169_RX_PAGE_SIZE	(PAGE_SIZE << R8169_RX_PAGE_ORDER)
 #define R8169_RX_HEADROOM	XDP_PACKET_HEADROOM
+#define R8169_RX_BUF_SIZE	(R8169_RX_PAGE_SIZE - R8169_RX_HEADROOM)
 #define NUM_TX_DESC	256	/* Number of Tx descriptor registers */
 #define NUM_RX_DESC	256	/* Number of Rx descriptor registers */
 #define R8169_TX_RING_BYTES	(NUM_TX_DESC * sizeof(struct TxDesc))
@@ -4609,7 +4609,7 @@ static void rtl_rx_refill(struct net_device *dev, struct rtl8169_private *tp)
 
 static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget)
 {
-	int count, cleaned_count = 0;
+	int count;
 
 	for (count = 0; count < budget; count++, tp->cur_rx++) {
 		unsigned int pkt_size, entry = tp->cur_rx % NUM_RX_DESC;
@@ -4630,7 +4630,6 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp, int budget
 
 		page = tp->Rx_databuff[entry];
 		tp->Rx_databuff[entry] = NULL;
-		cleaned_count++;
 
 		if (unlikely(status & RxRES)) {
 			if (net_ratelimit())
@@ -4692,7 +4691,6 @@ recycle_page:
 		page_pool_put_full_page(tp->page_pool, page, true);
 	}
 
-	tp->dirty_rx += cleaned_count;
 	rtl_rx_refill(dev, tp);
 
 	return count;
