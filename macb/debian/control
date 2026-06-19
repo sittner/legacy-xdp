@@ -1,0 +1,13 @@
+Source: macb-xdp-dkms
+Section: kernel
+Priority: optional
+Maintainer: Sascha <sascha@localhost>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+
+Package: macb-xdp-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Description: Cadence MACB/GEM driver with XDP support - DKMS
+ Out-of-tree Cadence MACB/GEM network driver with XDP (eXpress Data Path)
+ support. Built via DKMS for automatic rebuilds on kernel updates.

@@ -7,6 +7,8 @@
 #ifndef _MACB_H
 #define _MACB_H
 
+#include "compat.h"
+
 #include <linux/clk.h>
 #include <linux/phylink.h>
 #include <linux/ptp_clock_kernel.h>
@@ -14,6 +16,7 @@
 #include <linux/interrupt.h>
 #include <linux/phy/phy.h>
 #include <linux/workqueue.h>
+#include <net/xdp.h>
 
 #if defined(CONFIG_ARCH_DMA_ADDR_T_64BIT) || defined(CONFIG_MACB_USE_HWSTAMP)
 #define MACB_EXT_DESC
@@ -997,6 +1000,7 @@ struct macb_dma_desc_ptp {
  */
 struct macb_tx_skb {
 	struct sk_buff		*skb;
+	struct xdp_frame	*xdpf;
 	dma_addr_t		mapping;
 	size_t			size;
 	bool			mapped_as_page;
@@ -1214,6 +1218,8 @@ static const struct gem_statistic queue_statistics[] = {
 
 struct macb;
 struct macb_queue;
+struct page;
+struct page_pool;
 
 struct macb_or_gem_ops {
 	int	(*mog_alloc_rx_buffers)(struct macb *bp);
@@ -1312,7 +1318,9 @@ struct macb_queue {
 	unsigned int		rx_tail;
 	unsigned int		rx_prepared_head;
 	struct macb_dma_desc	*rx_ring;
-	struct sk_buff		**rx_skbuff;
+	struct page		**rx_buffers_page;
+	struct page_pool	*page_pool;
+	struct xdp_rxq_info	xdp_rxq;
 	void			*rx_buffers;
 	struct napi_struct	napi_rx;
 	struct queue_stats stats;
@@ -1355,6 +1363,7 @@ struct macb {
 	struct clk		*rx_clk;
 	struct clk		*tsu_clk;
 	struct net_device	*dev;
+	struct bpf_prog __rcu	*xdp_prog;
 	/* Protects hw_stats and ethtool_stats */
 	spinlock_t		stats_lock;
 	union {

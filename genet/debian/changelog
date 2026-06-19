@@ -1,0 +1,5 @@
+genet-xdp-dkms (6.18.35+xdp1) unstable; urgency=medium
+
+  * Initial DKMS packaging.
+
+ -- Sascha <sascha@localhost>  Thu, 19 Jun 2026 12:00:00 +0000

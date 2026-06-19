@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: e1000e-xdp
+License: GPL-2.0
+
+Files: *
+Copyright: Intel Corporation
+License: GPL-2.0

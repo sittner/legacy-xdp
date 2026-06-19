@@ -1,0 +1,5 @@
+ccflags-y += -I$(src)
+
+obj-m := r8169_xdp.o
+
+r8169_xdp-y := r8169_main.o r8169_firmware.o r8169_phy_config.o r8169_leds.o

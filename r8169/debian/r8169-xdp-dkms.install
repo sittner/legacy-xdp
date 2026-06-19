@@ -1,0 +1,7 @@
+*.c /usr/src/r8169-xdp-6.18.35+xdp1/r8169/
+*.h /usr/src/r8169-xdp-6.18.35+xdp1/r8169/
+Kbuild /usr/src/r8169-xdp-6.18.35+xdp1/r8169/
+Makefile /usr/src/r8169-xdp-6.18.35+xdp1/r8169/
+../compat/compat.h /usr/src/r8169-xdp-6.18.35+xdp1/compat/
+dkms.conf /usr/src/r8169-xdp-6.18.35+xdp1/
+r8169-xdp.conf /etc/modprobe.d/

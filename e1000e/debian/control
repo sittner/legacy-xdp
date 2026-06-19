@@ -1,0 +1,13 @@
+Source: e1000e-xdp-dkms
+Section: kernel
+Priority: optional
+Maintainer: Sascha <sascha@localhost>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+
+Package: e1000e-xdp-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Description: Intel PRO/1000 (e1000e) driver with XDP support - DKMS
+ Out-of-tree e1000e network driver with XDP (eXpress Data Path) support.
+ Built via DKMS for automatic rebuilds on kernel updates.

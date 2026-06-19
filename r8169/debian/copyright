@@ -1,0 +1,7 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: r8169-xdp
+License: GPL-2.0
+
+Files: *
+Copyright: Realtek Semiconductor Corp.
+License: GPL-2.0

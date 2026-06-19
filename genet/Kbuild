@@ -1,0 +1,5 @@
+ccflags-y += -I$(src)
+
+obj-m := genet_xdp.o
+
+genet_xdp-y := bcmgenet.o bcmmii.o bcmgenet_wol.o

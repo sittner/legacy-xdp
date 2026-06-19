@@ -1,0 +1,7 @@
+*.c /usr/src/genet-xdp-6.18.35+xdp1/genet/
+*.h /usr/src/genet-xdp-6.18.35+xdp1/genet/
+Kbuild /usr/src/genet-xdp-6.18.35+xdp1/genet/
+Makefile /usr/src/genet-xdp-6.18.35+xdp1/genet/
+../compat/compat.h /usr/src/genet-xdp-6.18.35+xdp1/compat/
+dkms.conf /usr/src/genet-xdp-6.18.35+xdp1/
+genet-xdp.conf /etc/modprobe.d/

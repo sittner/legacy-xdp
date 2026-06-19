@@ -1,0 +1,13 @@
+Source: r8169-xdp-dkms
+Section: kernel
+Priority: optional
+Maintainer: Sascha <sascha@localhost>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+
+Package: r8169-xdp-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Description: Realtek RTL8169 driver with XDP support - DKMS
+ Out-of-tree Realtek RTL8169 network driver with XDP (eXpress Data Path)
+ support. Built via DKMS for automatic rebuilds on kernel updates.

@@ -1,0 +1,7 @@
+*.c /usr/src/macb-xdp-6.18.35+xdp1/macb/
+*.h /usr/src/macb-xdp-6.18.35+xdp1/macb/
+Kbuild /usr/src/macb-xdp-6.18.35+xdp1/macb/
+Makefile /usr/src/macb-xdp-6.18.35+xdp1/macb/
+../compat/compat.h /usr/src/macb-xdp-6.18.35+xdp1/compat/
+dkms.conf /usr/src/macb-xdp-6.18.35+xdp1/
+macb-xdp.conf /etc/modprobe.d/

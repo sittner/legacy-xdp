@@ -1,0 +1,34 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.d
+*.order
+*.symvers
+.tmp_versions/
+Module.symvers
+modules.order
+
+# dpkg-buildpackage output
+*.deb
+*.buildinfo
+*.changes
+
+# debhelper build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.debhelper.log
+debian/*.substvars
+**/debian/.debhelper/
+**/debian/debhelper-build-stamp
+**/debian/files
+**/debian/*.debhelper.log
+**/debian/*.debhelper
+**/debian/*.substvars
+**/debian/e1000e-xdp-dkms/
+**/debian/genet-xdp-dkms/
+**/debian/macb-xdp-dkms/
+**/debian/r8169-xdp-dkms/

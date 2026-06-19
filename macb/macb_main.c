@@ -6,6 +6,8 @@
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
 #include <linux/circ_buf.h>
 #include <linux/clk-provider.h>
 #include <linux/clk.h>
@@ -41,6 +43,7 @@
 #include <linux/udp.h>
 #include <linux/gcd.h>
 #include <net/pkt_sched.h>
+#include <net/xdp.h>
 #include "macb.h"
 
 static unsigned int txdelay = 35;
@@ -582,7 +585,7 @@ static void macb_usx_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
 }
 
 static void macb_usx_pcs_get_state(struct phylink_pcs *pcs,
-				   unsigned int neg_mode,
+				   OOT_PCS_GET_STATE_NEG_MODE_ARG
 				   struct phylink_link_state *state)
 {
 	struct macb *bp = container_of(pcs, struct macb, phylink_usx_pcs);
@@ -613,7 +616,8 @@ static int macb_usx_pcs_config(struct phylink_pcs *pcs,
 	return 0;
 }
 
-static void macb_pcs_get_state(struct phylink_pcs *pcs, unsigned int neg_mode,
+static void macb_pcs_get_state(struct phylink_pcs *pcs,
+			       OOT_PCS_GET_STATE_NEG_MODE_ARG
 			       struct phylink_link_state *state)
 {
 	state->link = 0;
@@ -712,6 +716,7 @@ static void macb_tx_lpi_wake(struct macb *bp)
 	udelay(50);
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 static void macb_mac_disable_tx_lpi(struct phylink_config *config)
 {
 	struct net_device *ndev = to_net_dev(config->dev);
@@ -745,6 +750,7 @@ static int macb_mac_enable_tx_lpi(struct phylink_config *config, u32 timer,
 
 	return 0;
 }
+#endif
 
 static void macb_mac_config(struct phylink_config *config, unsigned int mode,
 			    const struct phylink_link_state *state)
@@ -1001,8 +1007,10 @@ static const struct phylink_mac_ops macb_phylink_ops = {
 	.mac_config = macb_mac_config,
 	.mac_link_down = macb_mac_link_down,
 	.mac_link_up = macb_mac_link_up,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 	.mac_disable_tx_lpi = macb_mac_disable_tx_lpi,
 	.mac_enable_tx_lpi = macb_mac_enable_tx_lpi,
+#endif
 };
 
 static bool macb_phy_handle_exists(struct device_node *dn)
@@ -1100,6 +1108,7 @@ static int macb_mii_probe(struct net_device *dev)
 
 	/* Configure EEE LPI if supported */
 	if (bp->caps & MACB_CAPS_EEE) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,13,0)
 		__set_bit(PHY_INTERFACE_MODE_MII,
 			  bp->phylink_config.lpi_interfaces);
 		__set_bit(PHY_INTERFACE_MODE_GMII,
@@ -1108,6 +1117,7 @@ static int macb_mii_probe(struct net_device *dev)
 		bp->phylink_config.lpi_capabilities = MAC_100FD | MAC_1000FD;
 		bp->phylink_config.lpi_timer_default = 250000;
 		bp->phylink_config.eee_enabled_default = true;
+#endif
 	}
 
 	bp->phylink = phylink_create(&bp->phylink_config, bp->pdev->dev.fwnode,
@@ -1241,6 +1251,11 @@ static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb, int budge
 		tx_skb->mapping = 0;
 	}
 
+	if (tx_skb->xdpf) {
+		xdp_return_frame(tx_skb->xdpf);
+		tx_skb->xdpf = NULL;
+	}
+
 	if (tx_skb->skb) {
 		dev_consume_skb_any(tx_skb->skb);
 		tx_skb->skb = NULL;
@@ -1263,25 +1278,6 @@ static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_
 	}
 #endif
 	desc->addr = lower_32_bits(addr);
-}
-
-static dma_addr_t macb_get_addr(struct macb *bp, struct macb_dma_desc *desc)
-{
-	dma_addr_t addr = 0;
-#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
-	struct macb_dma_desc_64 *desc_64;
-
-	if (bp->hw_dma_cap & HW_DMA_CAP_64B) {
-		desc_64 = macb_64b_desc(bp, desc);
-		addr = ((u64)(desc_64->addrh) << 32);
-	}
-#endif
-	addr |= MACB_BF(RX_WADDR, MACB_BFEXT(RX_WADDR, desc->addr));
-#ifdef CONFIG_MACB_USE_HWSTAMP
-	if (bp->hw_dma_cap & HW_DMA_CAP_PTP)
-		addr &= ~GEM_BIT(DMA_RXVALID);
-#endif
-	return addr;
 }
 
 static void macb_tx_error_task(struct work_struct *work)
@@ -1519,10 +1515,22 @@ static int macb_tx_complete(struct macb_queue *queue, int budget)
 	return packets;
 }
 
+static unsigned int gem_rx_page_offset(void)
+{
+	return XDP_PACKET_HEADROOM + NET_IP_ALIGN;
+}
+
+static unsigned int gem_rx_page_alloc_size(struct macb *bp)
+{
+	return SKB_HEAD_ALIGN(gem_rx_page_offset() + bp->rx_buffer_size);
+}
+
+static int macb_xdp_xmit_back(struct macb *bp, struct xdp_buff *xdp);
+
 static void gem_rx_refill(struct macb_queue *queue)
 {
 	unsigned int		entry;
-	struct sk_buff		*skb;
+	struct page		*page;
 	dma_addr_t		paddr;
 	struct macb *bp = queue->bp;
 	struct macb_dma_desc *desc;
@@ -1536,25 +1544,17 @@ static void gem_rx_refill(struct macb_queue *queue)
 
 		desc = macb_rx_desc(queue, entry);
 
-		if (!queue->rx_skbuff[entry]) {
-			/* allocate sk_buff for this free entry in ring */
-			skb = netdev_alloc_skb(bp->dev, bp->rx_buffer_size);
-			if (unlikely(!skb)) {
-				netdev_err(bp->dev,
-					   "Unable to allocate sk_buff\n");
+		page = queue->rx_buffers_page[entry];
+		if (!page) {
+			page = page_pool_dev_alloc_pages(queue->page_pool);
+			if (unlikely(!page)) {
+				netdev_err(bp->dev, "Unable to allocate RX page\n");
 				break;
 			}
 
-			/* now fill corresponding descriptor entry */
-			paddr = dma_map_single(&bp->pdev->dev, skb->data,
-					       bp->rx_buffer_size,
-					       DMA_FROM_DEVICE);
-			if (dma_mapping_error(&bp->pdev->dev, paddr)) {
-				dev_kfree_skb(skb);
-				break;
-			}
-
-			queue->rx_skbuff[entry] = skb;
+			queue->rx_buffers_page[entry] = page;
+			paddr = page_pool_get_dma_addr(page) +
+				gem_rx_page_offset();
 
 			if (entry == bp->rx_ring_size - 1)
 				paddr |= MACB_BIT(RX_WRAP);
@@ -1564,9 +1564,6 @@ static void gem_rx_refill(struct macb_queue *queue)
 			 */
 			dma_wmb();
 			macb_set_addr(bp, desc, paddr);
-
-			/* properly align Ethernet header */
-			skb_reserve(skb, NET_IP_ALIGN);
 		} else {
 			desc->ctrl = 0;
 			dma_wmb();
@@ -1607,16 +1604,22 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 		  int budget)
 {
 	struct macb *bp = queue->bp;
+	struct bpf_prog *prog;
 	unsigned int		len;
 	unsigned int		entry;
+	struct page		*page;
 	struct sk_buff		*skb;
 	struct macb_dma_desc	*desc;
+	bool xdp_redirect = false;
 	int			count = 0;
+
+	rcu_read_lock();
+	prog = rcu_dereference(bp->xdp_prog);
 
 	while (count < budget) {
 		u32 ctrl;
-		dma_addr_t addr;
 		bool rxused;
+		unsigned int headroom = gem_rx_page_offset();
 
 		entry = macb_rx_ring_wrap(bp, queue->rx_tail);
 		desc = macb_rx_desc(queue, entry);
@@ -1625,7 +1628,6 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 		rmb();
 
 		rxused = (desc->addr & MACB_BIT(RX_USED)) ? true : false;
-		addr = macb_get_addr(bp, desc);
 
 		if (!rxused)
 			break;
@@ -1645,8 +1647,8 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 			queue->stats.rx_dropped++;
 			break;
 		}
-		skb = queue->rx_skbuff[entry];
-		if (unlikely(!skb)) {
+		page = queue->rx_buffers_page[entry];
+		if (unlikely(!page)) {
 			netdev_err(bp->dev,
 				   "inconsistent Rx descriptor chain\n");
 			bp->dev->stats.rx_dropped++;
@@ -1654,14 +1656,72 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 			break;
 		}
 		/* now everything is ready for receiving packet */
-		queue->rx_skbuff[entry] = NULL;
+		queue->rx_buffers_page[entry] = NULL;
 		len = ctrl & bp->rx_frm_len_mask;
 
 		netdev_vdbg(bp->dev, "gem_rx %u (len %u)\n", entry, len);
 
+		page_pool_dma_sync_for_cpu(queue->page_pool, page, 0, len);
+		if (prog) {
+			struct xdp_buff xdp;
+			u32 act;
+
+			xdp_init_buff(&xdp, page_size(page), &queue->xdp_rxq);
+			xdp_prepare_buff(&xdp, page_address(page),
+					 gem_rx_page_offset(), len, false);
+
+			act = bpf_prog_run_xdp(prog, &xdp);
+			switch (act) {
+			case XDP_PASS:
+				len = xdp.data_end - xdp.data;
+				headroom = (unsigned long)xdp.data -
+					   (unsigned long)xdp.data_hard_start;
+				break;
+			case XDP_DROP:
+				xdp_return_buff(&xdp);
+				bp->dev->stats.rx_dropped++;
+				queue->stats.rx_dropped++;
+				continue;
+			case XDP_TX:
+				if (macb_xdp_xmit_back(bp, &xdp)) {
+					xdp_return_buff(&xdp);
+					bp->dev->stats.rx_dropped++;
+					queue->stats.rx_dropped++;
+				}
+				continue;
+			case XDP_REDIRECT:
+				if (xdp_do_redirect(bp->dev, &xdp, prog)) {
+					xdp_return_buff(&xdp);
+					bp->dev->stats.rx_dropped++;
+					queue->stats.rx_dropped++;
+				} else {
+					xdp_redirect = true;
+				}
+				continue;
+			default:
+				bpf_warn_invalid_xdp_action(bp->dev, prog, act);
+				fallthrough;
+			case XDP_ABORTED:
+				trace_xdp_exception(bp->dev, prog, act);
+				xdp_return_buff(&xdp);
+				bp->dev->stats.rx_dropped++;
+				queue->stats.rx_dropped++;
+				bp->dev->stats.rx_errors++;
+				continue;
+			}
+		}
+
+		skb = napi_build_skb(page_address(page), page_size(page));
+		if (unlikely(!skb)) {
+			page_pool_put_full_page(queue->page_pool, page, false);
+			bp->dev->stats.rx_dropped++;
+			queue->stats.rx_dropped++;
+			continue;
+		}
+
+		skb_reserve(skb, headroom);
 		skb_put(skb, len);
-		dma_unmap_single(&bp->pdev->dev, addr,
-				 bp->rx_buffer_size, DMA_FROM_DEVICE);
+		skb_mark_for_recycle(skb);
 
 		skb->protocol = eth_type_trans(skb, bp->dev);
 		skb_checksum_none_assert(skb);
@@ -1688,6 +1748,10 @@ static int gem_rx(struct macb_queue *queue, struct napi_struct *napi,
 
 		napi_gro_receive(napi, skb);
 	}
+
+	if (xdp_redirect)
+		xdp_do_flush();
+	rcu_read_unlock();
 
 	gem_rx_refill(queue);
 
@@ -2367,6 +2431,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 
 		/* Save info to properly release resources */
 		tx_skb->skb = NULL;
+		tx_skb->xdpf = NULL;
 		tx_skb->mapping = mapping;
 		tx_skb->size = size;
 		tx_skb->mapped_as_page = false;
@@ -2397,6 +2462,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 
 			/* Save info to properly release resources */
 			tx_skb->skb = NULL;
+			tx_skb->xdpf = NULL;
 			tx_skb->mapping = mapping;
 			tx_skb->size = size;
 			tx_skb->mapped_as_page = true;
@@ -2416,6 +2482,7 @@ static unsigned int macb_tx_map(struct macb *bp,
 
 	/* This is the last buffer of the frame: save socket buffer */
 	tx_skb->skb = skb;
+	tx_skb->xdpf = NULL;
 
 	/* Update TX ring: update buffer descriptors in reverse order
 	 * to avoid race condition
@@ -2602,6 +2669,143 @@ add_fcs:
 	return 0;
 }
 
+static struct macb_queue *macb_xdp_tx_queue(struct macb *bp)
+{
+	return &bp->queues[bp->num_queues - 1];
+}
+
+static void macb_xdp_kick_tx(struct macb *bp, struct macb_queue *queue)
+{
+	spin_lock(&bp->lock);
+	macb_tx_lpi_wake(bp);
+
+	if (macb_readl(bp, TSR) & MACB_BIT(TGO))
+		queue->tx_pending = 1;
+
+	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
+	(void)macb_readl(bp, NCR);
+	spin_unlock(&bp->lock);
+}
+
+static int macb_xdp_queue_one(struct macb *bp, struct macb_queue *queue,
+			      struct xdp_frame *xdpf, bool dma_map)
+{
+	struct macb_tx_skb *tx_skb, *next_skb;
+	struct macb_dma_desc *desc, *next_desc;
+	unsigned int entry, next_entry;
+	dma_addr_t mapping;
+	unsigned int len;
+
+	if (unlikely(xdp_frame_has_frags(xdpf)))
+		return -EOPNOTSUPP;
+
+	len = xdpf->len;
+	if (unlikely(!len || len > bp->max_tx_length))
+		return -EINVAL;
+
+	if (CIRC_SPACE(queue->tx_head, queue->tx_tail, bp->tx_ring_size) < 2)
+		return -EBUSY;
+
+	entry = macb_tx_ring_wrap(bp, queue->tx_head);
+	next_entry = macb_tx_ring_wrap(bp, queue->tx_head + 1);
+
+	tx_skb = &queue->tx_skb[entry];
+	next_skb = &queue->tx_skb[next_entry];
+	tx_skb->skb = NULL;
+	tx_skb->xdpf = xdpf;
+	tx_skb->size = len;
+	tx_skb->mapping = 0;
+	tx_skb->mapped_as_page = false;
+	next_skb->skb = NULL;
+	next_skb->xdpf = NULL;
+	next_skb->mapping = 0;
+
+	if (dma_map) {
+		mapping = dma_map_single(&bp->pdev->dev, xdpf->data, len,
+					 DMA_TO_DEVICE);
+		if (dma_mapping_error(&bp->pdev->dev, mapping))
+			return -ENOMEM;
+		tx_skb->mapping = mapping;
+	} else {
+		struct page *page = virt_to_head_page(xdpf->data);
+		unsigned long page_offset;
+
+		page_offset = (unsigned long)xdpf->data -
+			      (unsigned long)page_address(page);
+		mapping = page_pool_get_dma_addr(page) + page_offset;
+		/* RX page_pool pages are already DMA-mapped; keep mapping at 0
+		 * so macb_tx_unmap() skips dma_unmap_single() and hands the
+		 * frame back through xdp_return_frame().
+		 */
+		tx_skb->mapping = 0;
+	}
+
+	next_desc = macb_tx_desc(queue, next_entry);
+	next_desc->ctrl = MACB_BIT(TX_USED);
+
+	desc = macb_tx_desc(queue, entry);
+	macb_set_addr(bp, desc, mapping);
+	wmb();
+	desc->ctrl = len | MACB_BIT(TX_LAST) |
+		     (entry == bp->tx_ring_size - 1 ? MACB_BIT(TX_WRAP) : 0);
+
+	queue->tx_head++;
+	netdev_tx_sent_queue(netdev_get_tx_queue(bp->dev,
+						 queue - bp->queues), len);
+
+	return 0;
+}
+
+static int macb_xdp_xmit_back(struct macb *bp, struct xdp_buff *xdp)
+{
+	struct macb_queue *queue = macb_xdp_tx_queue(bp);
+	struct xdp_frame *xdpf;
+	unsigned long flags;
+	int ret;
+
+	xdpf = xdp_convert_buff_to_frame(xdp);
+	if (unlikely(!xdpf))
+		return -ENOMEM;
+
+	spin_lock_irqsave(&queue->tx_ptr_lock, flags);
+	ret = macb_xdp_queue_one(bp, queue, xdpf, false);
+	spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
+	if (ret) {
+		xdp_return_frame(xdpf);
+		return ret;
+	}
+
+	macb_xdp_kick_tx(bp, queue);
+	return 0;
+}
+
+static int macb_xdp_xmit(struct net_device *dev, int n,
+			 struct xdp_frame **frames, u32 flags)
+{
+	struct macb *bp = netdev_priv(dev);
+	struct macb_queue *queue = macb_xdp_tx_queue(bp);
+	unsigned long lock_flags;
+	int i, nxmit = 0;
+	int ret;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+
+	spin_lock_irqsave(&queue->tx_ptr_lock, lock_flags);
+	for (i = 0; i < n; i++) {
+		ret = macb_xdp_queue_one(bp, queue, frames[i], true);
+		if (ret)
+			break;
+		nxmit++;
+	}
+	spin_unlock_irqrestore(&queue->tx_ptr_lock, lock_flags);
+
+	if (nxmit)
+		macb_xdp_kick_tx(bp, queue);
+
+	return nxmit;
+}
+
 static netdev_tx_t macb_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	u16 queue_index = skb_get_queue_mapping(skb);
@@ -2739,34 +2943,30 @@ static void macb_init_rx_buffer_size(struct macb *bp, size_t size)
 
 static void gem_free_rx_buffers(struct macb *bp)
 {
-	struct sk_buff		*skb;
-	struct macb_dma_desc	*desc;
+	struct page		*page;
 	struct macb_queue *queue;
-	dma_addr_t		addr;
 	unsigned int q;
 	int i;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		if (!queue->rx_skbuff)
-			continue;
+		if (queue->rx_buffers_page) {
+			for (i = 0; i < bp->rx_ring_size; i++) {
+				page = queue->rx_buffers_page[i];
+				if (!page)
+					continue;
 
-		for (i = 0; i < bp->rx_ring_size; i++) {
-			skb = queue->rx_skbuff[i];
+				page_pool_put_full_page(queue->page_pool,
+							 page, false);
+			}
 
-			if (!skb)
-				continue;
-
-			desc = macb_rx_desc(queue, i);
-			addr = macb_get_addr(bp, desc);
-
-			dma_unmap_single(&bp->pdev->dev, addr, bp->rx_buffer_size,
-					DMA_FROM_DEVICE);
-			dev_kfree_skb_any(skb);
-			skb = NULL;
+			kfree(queue->rx_buffers_page);
+			queue->rx_buffers_page = NULL;
 		}
 
-		kfree(queue->rx_skbuff);
-		queue->rx_skbuff = NULL;
+		if (queue->page_pool) {
+			page_pool_destroy(queue->page_pool);
+			queue->page_pool = NULL;
+		}
 	}
 }
 
@@ -2824,18 +3024,43 @@ static void macb_free_consistent(struct macb *bp)
 static int gem_alloc_rx_buffers(struct macb *bp)
 {
 	struct macb_queue *queue;
+	struct page_pool *page_pool;
+	struct page_pool_params pp_params;
+	unsigned int page_pool_size;
 	unsigned int q;
 	int size;
 
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
-		size = bp->rx_ring_size * sizeof(struct sk_buff *);
-		queue->rx_skbuff = kzalloc(size, GFP_KERNEL);
-		if (!queue->rx_skbuff)
+		size = bp->rx_ring_size * sizeof(struct page *);
+		queue->rx_buffers_page = kzalloc(size, GFP_KERNEL);
+		if (!queue->rx_buffers_page)
 			return -ENOMEM;
-		else
-			netdev_dbg(bp->dev,
-				   "Allocated %d RX struct sk_buff entries at %p\n",
-				   bp->rx_ring_size, queue->rx_skbuff);
+
+		page_pool_size = gem_rx_page_alloc_size(bp);
+		pp_params = (struct page_pool_params) {
+			.order = get_order(page_pool_size),
+			.pool_size = bp->rx_ring_size,
+			.nid = dev_to_node(&bp->pdev->dev),
+			.dev = &bp->pdev->dev,
+			.napi = &queue->napi_rx,
+			.dma_dir = DMA_FROM_DEVICE,
+			.max_len = bp->rx_buffer_size,
+			.offset = gem_rx_page_offset(),
+			.netdev = bp->dev,
+			.queue_idx = q,
+			.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
+		};
+
+		page_pool = page_pool_create(&pp_params);
+		if (IS_ERR(page_pool)) {
+			kfree(queue->rx_buffers_page);
+			queue->rx_buffers_page = NULL;
+			return PTR_ERR(page_pool);
+		}
+		queue->page_pool = page_pool;
+
+		netdev_dbg(bp->dev, "Allocated %d RX page entries at %p\n",
+			   bp->rx_ring_size, queue->rx_buffers_page);
 	}
 	return 0;
 }
@@ -3323,6 +3548,80 @@ static void macb_set_rx_mode(struct net_device *dev)
 	macb_writel(bp, NCFGR, cfg);
 }
 
+static int macb_xdp(struct net_device *dev, struct netdev_bpf *bpf)
+{
+	struct macb *bp = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+
+	if (!macb_is_gem(bp))
+		return -EOPNOTSUPP;
+
+	switch (bpf->command) {
+	case XDP_SETUP_PROG:
+		if (bpf->prog && netif_running(dev) &&
+		    gem_rx_page_alloc_size(bp) > PAGE_SIZE) {
+			NL_SET_ERR_MSG_MOD(bpf->extack,
+					   "XDP needs RX frame to fit in one page");
+			return -EOPNOTSUPP;
+		}
+
+		old_prog = rtnl_dereference(bp->xdp_prog);
+		rcu_assign_pointer(bp->xdp_prog, bpf->prog);
+		if (old_prog)
+			bpf_prog_put(old_prog);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int macb_xdp_rxq_register(struct macb *bp)
+{
+	struct macb_queue *queue;
+	unsigned int q;
+	int err;
+
+	if (!macb_is_gem(bp))
+		return 0;
+
+	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
+		err = xdp_rxq_info_reg(&queue->xdp_rxq, bp->dev, q,
+				       queue->napi_rx.napi_id);
+		if (err)
+			goto err_unreg;
+
+		err = xdp_rxq_info_reg_mem_model(&queue->xdp_rxq,
+						 MEM_TYPE_PAGE_POOL,
+						 queue->page_pool);
+		if (err) {
+			xdp_rxq_info_unreg(&queue->xdp_rxq);
+			goto err_unreg;
+		}
+	}
+
+	return 0;
+
+err_unreg:
+	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue)
+		if (xdp_rxq_info_is_reg(&queue->xdp_rxq))
+			xdp_rxq_info_unreg(&queue->xdp_rxq);
+
+	return err;
+}
+
+static void macb_xdp_rxq_unregister(struct macb *bp)
+{
+	struct macb_queue *queue;
+	unsigned int q;
+
+	if (!macb_is_gem(bp))
+		return;
+
+	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue)
+		if (xdp_rxq_info_is_reg(&queue->xdp_rxq))
+			xdp_rxq_info_unreg(&queue->xdp_rxq);
+}
+
 static int macb_open(struct net_device *dev)
 {
 	size_t bufsz = dev->mtu + ETH_HLEN + ETH_FCS_LEN + NET_IP_ALIGN;
@@ -3358,6 +3657,10 @@ static int macb_open(struct net_device *dev)
 				      msecs_to_jiffies(MACB_TX_STALL_INTERVAL_MS));
 	}
 
+	err = macb_xdp_rxq_register(bp);
+	if (err)
+		goto reset_hw;
+
 	macb_init_hw(bp);
 
 	err = phy_power_on(bp->sgmii_phy);
@@ -3380,6 +3683,7 @@ phy_off:
 
 reset_hw:
 	macb_reset_hw(bp);
+	macb_xdp_rxq_unregister(bp);
 	for (q = 0, queue = bp->queues; q < bp->num_queues; ++q, ++queue) {
 		napi_disable(&queue->napi_rx);
 		napi_disable(&queue->napi_tx);
@@ -3405,6 +3709,7 @@ static int macb_close(struct net_device *dev)
 		cancel_delayed_work_sync(&queue->tx_stall_watchdog_work);
 		netdev_tx_reset_queue(netdev_get_tx_queue(dev, q));
 	}
+	macb_xdp_rxq_unregister(bp);
 
 	cancel_delayed_work_sync(&bp->tx_lpi_work);
 
@@ -4767,6 +5072,8 @@ static const struct net_device_ops macb_netdev_ops = {
 	.ndo_hwtstamp_set	= macb_hwtstamp_set,
 	.ndo_hwtstamp_get	= macb_hwtstamp_get,
 	.ndo_setup_tc		= macb_setup_tc,
+	.ndo_bpf		= macb_xdp,
+	.ndo_xdp_xmit		= macb_xdp_xmit,
 };
 
 /* Configure peripheral capabilities according to device tree
