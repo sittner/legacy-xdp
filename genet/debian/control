@@ -1,0 +1,13 @@
+Source: genet-xdp-dkms
+Section: kernel
+Priority: optional
+Maintainer: Sascha <sascha@localhost>
+Build-Depends: debhelper-compat (= 13), dkms
+Standards-Version: 4.6.2
+
+Package: genet-xdp-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Description: Broadcom GENET driver with XDP support - DKMS
+ Out-of-tree Broadcom GENET network driver with XDP (eXpress Data Path)
+ support. Built via DKMS for automatic rebuilds on kernel updates.

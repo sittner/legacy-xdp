@@ -1,0 +1,6 @@
+*.c /usr/src/r8169-xdp-6.18.35+xdp1/
+*.h /usr/src/r8169-xdp-6.18.35+xdp1/
+Kbuild /usr/src/r8169-xdp-6.18.35+xdp1/
+Makefile /usr/src/r8169-xdp-6.18.35+xdp1/
+dkms.conf /usr/src/r8169-xdp-6.18.35+xdp1/
+../compat/compat.h /usr/src/r8169-xdp-6.18.35+xdp1/compat/

@@ -1,0 +1,6 @@
+*.c /usr/src/e1000e-xdp-6.18.35+xdp1/
+*.h /usr/src/e1000e-xdp-6.18.35+xdp1/
+Kbuild /usr/src/e1000e-xdp-6.18.35+xdp1/
+Makefile /usr/src/e1000e-xdp-6.18.35+xdp1/
+dkms.conf /usr/src/e1000e-xdp-6.18.35+xdp1/
+../compat/compat.h /usr/src/e1000e-xdp-6.18.35+xdp1/compat/

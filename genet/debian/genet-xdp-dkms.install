@@ -1,0 +1,6 @@
+*.c /usr/src/genet-xdp-6.18.35+xdp1/
+*.h /usr/src/genet-xdp-6.18.35+xdp1/
+Kbuild /usr/src/genet-xdp-6.18.35+xdp1/
+Makefile /usr/src/genet-xdp-6.18.35+xdp1/
+dkms.conf /usr/src/genet-xdp-6.18.35+xdp1/
+../compat/compat.h /usr/src/genet-xdp-6.18.35+xdp1/compat/
