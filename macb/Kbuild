@@ -1,5 +1,5 @@
 ccflags-y += -I$(src)
 ccflags-y += -DCONFIG_MACB_USE_HWSTAMP
 
-obj-m := macb.o
-macb-y := macb_main.o macb_ptp.o
+obj-m := macb_xdp.o
+macb_xdp-y := macb_main.o macb_ptp.o

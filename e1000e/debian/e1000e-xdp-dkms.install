@@ -1,6 +1,7 @@
-*.c /usr/src/e1000e-xdp-6.18.35+xdp1/
-*.h /usr/src/e1000e-xdp-6.18.35+xdp1/
-Kbuild /usr/src/e1000e-xdp-6.18.35+xdp1/
-Makefile /usr/src/e1000e-xdp-6.18.35+xdp1/
-dkms.conf /usr/src/e1000e-xdp-6.18.35+xdp1/
+*.c /usr/src/e1000e-xdp-6.18.35+xdp1/e1000e/
+*.h /usr/src/e1000e-xdp-6.18.35+xdp1/e1000e/
+Kbuild /usr/src/e1000e-xdp-6.18.35+xdp1/e1000e/
+Makefile /usr/src/e1000e-xdp-6.18.35+xdp1/e1000e/
 ../compat/compat.h /usr/src/e1000e-xdp-6.18.35+xdp1/compat/
+dkms.conf /usr/src/e1000e-xdp-6.18.35+xdp1/
+e1000e-xdp.conf /etc/modprobe.d/

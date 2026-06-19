@@ -148,10 +148,17 @@ static inline long rgmii_clock(int speed)
 #endif
 
 /* phy_disable_eee_mode() was introduced in 6.18 to clear a single EEE link
- * mode from the PHY's advertised set.  On older kernels manipulate
- * advertising_eee directly.
+ * mode from the PHY's advertised set.  On 6.9..6.17 manipulate
+ * advertising_eee directly.  On < 6.9 advertising_eee doesn't exist;
+ * provide a no-op since those kernels manage EEE differently.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+static inline void phy_disable_eee_mode(struct phy_device *phydev,
+					int link_mode)
+{
+	/* advertising_eee does not exist before 6.9; nothing to do */
+}
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(6,18,0)
 #include <linux/phy.h>
 static inline void phy_disable_eee_mode(struct phy_device *phydev,
 					int link_mode)
