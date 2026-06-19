@@ -1,15 +1,14 @@
 # e1000e — Intel PRO/1000 PCIe Ethernet Driver (out-of-tree)
 
 This directory contains the **upstream Intel e1000e Ethernet driver** extracted
-from the Linux 6.15 kernel (latest stable at time of extraction; targeting
-compatibility with Linux 6.1 through 6.18+), set up as a **standalone
-out-of-tree kernel module**.
+from the Linux 6.18 kernel, set up as a **standalone out-of-tree kernel
+module** with compatibility shims for Linux 6.1 through 6.18+.
 
-The driver source is taken verbatim from:
+The driver source is taken from:
 ```
 drivers/net/ethernet/intel/e1000e/
 ```
-in the Linux kernel tree (`torvalds/linux`, tag `v6.15`).
+in the Linux kernel tree (`torvalds/linux`, tag `v6.18`).
 
 ## Purpose
 
@@ -51,12 +50,12 @@ To clean:
 make clean
 ```
 
-The built module is `e1000e.ko`. Load it with:
+The built module is `e1000e_xdp.ko`. Load it with:
 
 ```sh
-sudo insmod e1000e.ko
-# or
-sudo modprobe e1000e
+sudo insmod e1000e_xdp.ko
+# or, if installed via DKMS
+sudo modprobe e1000e_xdp
 ```
 
 > **Note**: This out-of-tree module replaces the in-tree `e1000e` driver.
@@ -69,12 +68,13 @@ sudo modprobe e1000e
 
 **Linux 6.1 – 6.18+**
 
-The driver source is from v6.15, with local XDP and compat-layer updates
+The driver source is from v6.18, with local XDP and compat-layer updates
 to handle API differences across the 6.1–6.18 range.
 
 ## Source Files
 
-All files are copied verbatim from upstream Linux v6.15:
+All files are based on upstream Linux v6.18, with XDP and compat-layer
+modifications:
 
 | File | Description |
 |------|-------------|
@@ -100,8 +100,9 @@ All files are copied verbatim from upstream Linux v6.15:
 | `manage.h` | Management operation declarations |
 | `nvm.h` | NVM operation declarations |
 | `phy.h` | PHY operation declarations |
-| `ptp.h` | PTP declarations |
 | `e1000e_trace.h` | Tracepoint definitions |
+| `compat.h` | Kernel version compatibility shims |
+| `Kbuild` | Out-of-tree build configuration |
 
 ## Reference
 

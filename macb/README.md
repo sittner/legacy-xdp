@@ -24,7 +24,7 @@ Requires kernel headers matching the running kernel.
 
 ```bash
 make
-sudo insmod macb.ko    # or replace the in-tree module
+sudo insmod macb_xdp.ko    # or replace the in-tree module
 ```
 
 ## Usage
