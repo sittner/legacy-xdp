@@ -26,6 +26,7 @@ debian/*.substvars
 **/debian/debhelper-build-stamp
 **/debian/files
 **/debian/*.debhelper.log
+**/debian/*.debhelper
 **/debian/*.substvars
 **/debian/e1000e-xdp-dkms/
 **/debian/genet-xdp-dkms/
