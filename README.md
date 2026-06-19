@@ -62,6 +62,12 @@ make clean
 Each driver can be packaged as a Debian DKMS package that auto-rebuilds the
 module on kernel upgrades.
 
+Build dependencies:
+
+```bash
+sudo apt install dpkg-dev debhelper dkms dh-dkms
+```
+
 ```bash
 # Build all .deb packages
 make deb
