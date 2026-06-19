@@ -1,4 +1,4 @@
-e1000e-xdp-dkms (6.18.35+xdp1-1) unstable; urgency=medium
+e1000e-xdp-dkms (6.18.35+xdp1) unstable; urgency=medium
 
   * Initial DKMS packaging.
 
