@@ -37,7 +37,12 @@
 #include <linux/phy.h>
 #include <linux/platform_data/bcmgenet.h>
 
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,7,0)
+#include <asm/unaligned.h>
+#else
 #include <linux/unaligned.h>
+#endif
 #include <linux/bpf_trace.h>
 
 #include "bcmgenet.h"
