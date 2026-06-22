@@ -4362,6 +4362,7 @@ static void bcmgenet_remove(struct platform_device *pdev)
 	bcmgenet_mii_exit(priv->dev);
 	free_netdev(priv->dev);
 }
+OOT_PLATFORM_REMOVE_DECL(bcmgenet_remove)
 
 static void bcmgenet_shutdown(struct platform_device *pdev)
 {
@@ -4602,7 +4603,7 @@ MODULE_DEVICE_TABLE(acpi, genet_acpi_match);
 
 static struct platform_driver bcmgenet_driver = {
 	.probe	= bcmgenet_probe,
-	.remove = bcmgenet_remove,
+	OOT_PLATFORM_REMOVE(bcmgenet_remove),
 	.shutdown = bcmgenet_shutdown,
 	.driver	= {
 		.name	= "bcmgenet",
