@@ -2343,7 +2343,7 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 
 		if (unlikely(!page)) {
 			BCMGENET_STATS64_INC(stats, dropped);
-			goto next;
+			break;
 		}
 
 		/* Sync the page for CPU access */
