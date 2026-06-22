@@ -109,7 +109,7 @@ void bcmgenet_mii_setup(struct net_device *dev)
 		bcmgenet_ext_writel(priv, reg, EXT_RGMII_OOB_CTRL);
 	}
 
-	bcmgenet_eee_enable_set(dev, phydev->enable_tx_lpi);
+	bcmgenet_eee_enable_set(dev, oot_phydev_tx_lpi(phydev));
 
 	phy_print_status(phydev);
 }
@@ -488,7 +488,7 @@ static int bcmgenet_mii_register(struct bcmgenet_priv *priv)
 	/* Pass a reference to our "main" clock which is used for MDIO
 	 * transfers
 	 */
-	ppd.clk = priv->clk;
+	OOT_UNIMAC_MDIO_SET_CLK(ppd, priv->clk);
 
 	/* Unimac MDIO bus controller starts at UniMAC offset + MDIO_CMD
 	 * and is 2 * 32-bits word long, 8 bytes total.

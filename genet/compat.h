@@ -10,6 +10,40 @@
 #include "../compat/compat.h"
 
 /* ────────────────────────────────────────────────────────────────────────────
+ * PHY / EEE helpers (pre-6.9)
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/* phy_support_eee() was introduced in 6.9 to advertise EEE capabilities
+ * during auto-negotiation.  On older kernels this was handled implicitly
+ * by the PHY subsystem; a no-op stub is sufficient.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+static inline void phy_support_eee(struct phy_device *phydev) {}
+#endif
+
+/* phydev->enable_tx_lpi was introduced in 6.9 (EEE rework).  On older
+ * kernels use eee_enabled which served the same purpose.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+#define oot_phydev_tx_lpi(phydev)  ((phydev)->eee_enabled)
+#else
+#define oot_phydev_tx_lpi(phydev)  ((phydev)->enable_tx_lpi)
+#endif
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * unimac_mdio_pdata helpers
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/* The 'clk' field was added to struct unimac_mdio_pdata in 6.9.
+ * On older kernels the clock is managed internally; skip the assignment.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,9,0)
+#define OOT_UNIMAC_MDIO_SET_CLK(ppd, clk_ptr)  do { } while (0)
+#else
+#define OOT_UNIMAC_MDIO_SET_CLK(ppd, clk_ptr)  ((ppd).clk = (clk_ptr))
+#endif
+
+/* ────────────────────────────────────────────────────────────────────────────
  * DIM (Dynamic Interrupt Moderation) helpers
  * ──────────────────────────────────────────────────────────────────────────── */
 
