@@ -211,8 +211,12 @@ static inline void phy_disable_eee_mode(struct phy_device *phydev,
  * On kernels >= 6.6, net/page_pool/helpers.h transitively pulls in net/xdp.h
  * (and thereby uapi/linux/bpf.h) which defines XDP_PACKET_HEADROOM.  The old
  * net/page_pool.h does not, so provide the fallback define here.
+ *
+ * Note: page_pool_dma_sync_for_cpu() and page_pool_params.{napi,netdev} were
+ * added later (not in all 6.6 RT/stable builds); those are guarded separately
+ * below at 6.7.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,7,0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,6,0)
 #include <net/page_pool/helpers.h>
 #else
 #include <net/page_pool.h>
